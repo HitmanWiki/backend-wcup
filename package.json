@@ -4,7 +4,7 @@
   "description": "World Cup 2026 Betting Backend",
   "main": "api/server.js",
   "engines": {
-    "node": "24.x"
+    "node": "20.x"
   },
   "scripts": {
     "dev": "node api/server.js",
@@ -14,7 +14,7 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "axios": "^1.6.0",
-    "sqlite3": "^5.1.7",
+    "sqlite3": "^5.1.6",
     "dotenv": "^16.3.1"
   }
 }
