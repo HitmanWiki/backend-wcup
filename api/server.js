@@ -1,21 +1,19 @@
 /**
  * World Cup 2026 Betting — Backend API
- * EXACT same logic as your local working version
- * Adapted for Vercel deployment
+ * FIXED ROUTING for Vercel
  */
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-const sqlite3 = require("sqlite3").verbose(); // Changed from better-sqlite3
+const sqlite3 = require("sqlite3").verbose();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ─── Config ────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
 const FOOTBALL_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
 const isVercel = process.env.VERCEL === '1';
 
@@ -23,7 +21,7 @@ const isVercel = process.env.VERCEL === '1';
 const dbPath = isVercel ? '/tmp/worldcup.db' : './worldcup.db';
 const db = new sqlite3.Database(dbPath);
 
-// Promisify database operations to match better-sqlite3's sync style
+// Promisify database operations
 const dbGet = (sql, params = []) => {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, result) => {
@@ -51,7 +49,7 @@ const dbRun = (sql, params = []) => {
   });
 };
 
-// Initialize database (runs once)
+// Initialize database
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS matches (
@@ -74,9 +72,7 @@ db.serialize(() => {
 
 // ─── Football-Data.org API ─────────────────────────────────────────────────
 const API_BASE = "https://api.football-data.org/v4";
-const API_HEADERS = {
-  "X-Auth-Token": FOOTBALL_API_KEY
-};
+const API_HEADERS = FOOTBALL_API_KEY ? { "X-Auth-Token": FOOTBALL_API_KEY } : {};
 
 // ─── Helper: Normalize team names ─────────────────────────────────────────
 function normalizeTeam(name) {
@@ -85,24 +81,7 @@ function normalizeTeam(name) {
     "Korea Republic": "South Korea",
     "IR Iran": "Iran",
     "Bosnia-Herzegovina": "Bosnia",
-    "Côte d'Ivoire": "Ivory Coast",
-    "USA": "USA",
-    "Mexico": "Mexico",
-    "Canada": "Canada",
-    "Brazil": "Brazil",
-    "Argentina": "Argentina",
-    "Germany": "Germany",
-    "France": "France",
-    "England": "England",
-    "Spain": "Spain",
-    "Italy": "Italy",
-    "Netherlands": "Netherlands",
-    "Portugal": "Portugal",
-    "Belgium": "Belgium",
-    "Croatia": "Croatia",
-    "Morocco": "Morocco",
-    "Japan": "Japan",
-    "Senegal": "Senegal"
+    "Côte d'Ivoire": "Ivory Coast"
   };
   return map[name] || name;
 }
@@ -112,10 +91,15 @@ async function fetchAndStoreMatches() {
   try {
     console.log("📡 Fetching matches from football-data.org...");
     
+    if (!FOOTBALL_API_KEY) {
+      console.error("❌ No API key found");
+      return;
+    }
+    
     let matches = [];
     let usedCode = null;
     
-    // Try World Cup first, then other competitions
+    // Try World Cup first
     const codesToTry = ['WC', 'CL', 'PL', 'BL1', 'PD', 'SA', 'FL1'];
     
     for (const code of codesToTry) {
@@ -145,7 +129,7 @@ async function fetchAndStoreMatches() {
     
     console.log(`✅ Successfully fetched ${matches.length} matches from ${usedCode}`);
     
-    // Clear existing matches and insert new ones
+    // Clear and store new matches
     await dbRun("DELETE FROM matches");
     
     let stored = 0;
@@ -171,7 +155,7 @@ async function fetchAndStoreMatches() {
         );
         stored++;
       } catch (e) {
-        console.log(`   ⚠️ Skipping duplicate match: ${match.id}`);
+        // Skip duplicates
       }
     }
     
@@ -217,7 +201,39 @@ function formatMatch(row) {
   };
 }
 
-// ─── Express App ───────────────────────────────────────────────────────────
+// ─── API Endpoints (WITH /api prefix) ─────────────────────────────────────
+
+// Root redirect to API docs
+app.get("/", (req, res) => {
+  res.json({
+    name: "World Cup 2026 API",
+    endpoints: {
+      health: "/api/health",
+      matches: "/api/matches",
+      match: "/api/matches/:id",
+      stats: "/api/stats",
+      leaderboard: "/api/leaderboard",
+      ultimate: "/api/ultimate",
+      refresh: "/api/refresh"
+    },
+    status: "running"
+  });
+});
+
+// Health check
+app.get("/api/health", async (req, res) => {
+  try {
+    const count = await dbGet("SELECT COUNT(*) as c FROM matches");
+    res.json({ 
+      status: "ok", 
+      matchesInDB: count?.c || 0,
+      apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.json({ status: "ok", matchesInDB: 0 });
+  }
+});
 
 // GET /api/matches
 app.get("/api/matches", async (req, res) => {
@@ -243,14 +259,14 @@ app.get("/api/matches/:id", async (req, res) => {
 // GET /api/stats
 app.get("/api/stats", async (req, res) => {
   try {
-    const matchCount = await dbGet("SELECT COUNT(*) as c FROM matches");
-    const liveMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='IN_PLAY'");
-    const finishedMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='FINISHED'");
+    const matchCount = await dbGet("SELECT COUNT(*) as c FROM matches") || { c: 0 };
+    const liveMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='IN_PLAY'") || { c: 0 };
+    const finishedMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='FINISHED'") || { c: 0 };
     
     res.json({
-      matchCount: matchCount?.c || 0,
-      liveMatches: liveMatches?.c || 0,
-      finishedMatches: finishedMatches?.c || 0,
+      matchCount: matchCount.c,
+      liveMatches: liveMatches.c,
+      finishedMatches: finishedMatches.c,
       totalVolumeCLUTCH: "125000",
       uniqueUsers: 1243,
       totalBets: 5678
@@ -262,44 +278,38 @@ app.get("/api/stats", async (req, res) => {
 
 // GET /api/leaderboard
 app.get("/api/leaderboard", (req, res) => {
-  const demoLeaderboard = [
-    { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
-    { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 },
-    { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 },
-    { user: "0x4567...8901", total_wagered: "29000", bet_count: 15 },
-    { user: "0x5678...9012", total_wagered: "21000", bet_count: 12 }
-  ];
-  res.json({ leaderboard: demoLeaderboard });
+  res.json({
+    leaderboard: [
+      { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
+      { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 },
+      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 }
+    ]
+  });
 });
 
 // GET /api/ultimate
 app.get("/api/ultimate", (req, res) => {
-  const teams = [
-    { team: "Brazil", amount: "45000" },
-    { team: "Argentina", amount: "38000" },
-    { team: "France", amount: "32000" },
-    { team: "Germany", amount: "28000" },
-    { team: "England", amount: "25000" }
-  ];
-  
   res.json({
     deadline: Math.floor(Date.now() / 1000) + 2592000,
     settled: false,
     winner: null,
     totalPool: "168000",
-    teamPools: teams
+    teamPools: [
+      { team: "Brazil", amount: "45000" },
+      { team: "Argentina", amount: "38000" },
+      { team: "France", amount: "32000" }
+    ]
   });
 });
 
-// GET /api/health
-app.get("/api/health", async (req, res) => {
-  const count = await dbGet("SELECT COUNT(*) as c FROM matches");
-  res.json({ 
-    status: "ok", 
-    matches: count?.c || 0,
-    vercel: isVercel,
-    apiKey: FOOTBALL_API_KEY ? "✅" : "❌"
-  });
+// POST /api/refresh - Manually trigger refresh
+app.post("/api/refresh", async (req, res) => {
+  try {
+    await fetchAndStoreMatches();
+    res.json({ success: true, message: "Matches refreshed" });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // ─── Initialize on cold start ─────────────────────────────────────────────
@@ -308,12 +318,10 @@ async function initialize() {
   if (!count || count.c === 0) {
     console.log("🔄 No matches found, fetching...");
     await fetchAndStoreMatches();
-  } else {
-    console.log(`📊 Database has ${count.c} matches`);
   }
 }
 
-// Run initialization (don't await - let it run in background)
+// Run initialization
 initialize().catch(console.error);
 
 // ─── Export for Vercel ────────────────────────────────────────────────────
