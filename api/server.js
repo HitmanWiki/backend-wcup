@@ -1,14 +1,13 @@
 /**
  * World Cup 2026 Betting — Backend API
- * EXACT same logic as your local version
- * Adapted for Vercel deployment
+ * Complete version with debug endpoints
  */
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
-const sqlite3 = require("sqlite3").verbose(); // Changed from better-sqlite3
+const sqlite3 = require("sqlite3").verbose();
 
 const app = express();
 app.use(cors());
@@ -18,13 +17,11 @@ app.use(express.json());
 const FOOTBALL_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
 const isVercel = process.env.VERCEL === '1';
 
-// ─── DB Setup for Vercel ──────────────────────────────────────────────────
+// ─── Database Setup ──────────────────────────────────────────────────────
 const dbPath = isVercel ? '/tmp/worldcup.db' : './worldcup.db';
-
-// Create/Open database
 const db = new sqlite3.Database(dbPath);
 
-// Promisify database operations to match better-sqlite3's sync style
+// Promisify database operations
 const dbGet = (sql, params = []) => {
   return new Promise((resolve, reject) => {
     db.get(sql, params, (err, result) => {
@@ -52,7 +49,7 @@ const dbRun = (sql, params = []) => {
   });
 };
 
-// Initialize database - exactly like your local version
+// Initialize database
 db.serialize(() => {
   db.run(`
     CREATE TABLE IF NOT EXISTS matches (
@@ -142,6 +139,22 @@ function getDemoMatches() {
       awayTeam: { name: "Spain" },
       status: "IN_PLAY",
       score: { fullTime: { home: 1, away: 0 } }
+    },
+    {
+      id: 5,
+      utcDate: new Date(now * 1000 + 259200000).toISOString(),
+      homeTeam: { name: "France" },
+      awayTeam: { name: "Portugal" },
+      status: "SCHEDULED",
+      score: { fullTime: { home: null, away: null } }
+    },
+    {
+      id: 6,
+      utcDate: new Date(now * 1000 + 345600000).toISOString(),
+      homeTeam: { name: "Netherlands" },
+      awayTeam: { name: "Belgium" },
+      status: "SCHEDULED",
+      score: { fullTime: { home: null, away: null } }
     }
   ];
 }
@@ -154,14 +167,14 @@ async function fetchAndStoreMatches() {
     let matches = [];
     let usedCode = null;
     
-    const codesToTry = ['WC', 'CL', 'PL', 'BL1', 'PD', 'SA', 'FL1'];
+    const codesToTry = ['WC', 'PL', 'PD', 'BL1', 'SA', 'FL1', 'CL'];
     
     for (const code of codesToTry) {
       try {
         console.log(`   Trying competition code: ${code}...`);
         const response = await axios.get(
-          `${API_BASE}/competitions/${code}/matches?status=SCHEDULED,IN_PLAY,FINISHED`,
-          { headers: API_HEADERS, timeout: 10000 }
+          `${API_BASE}/competitions/${code}/matches?status=SCHEDULED,IN_PLAY,FINISHED&limit=50`,
+          { headers: API_HEADERS, timeout: 8000 }
         );
         
         if (response.data.matches && response.data.matches.length > 0) {
@@ -169,13 +182,19 @@ async function fetchAndStoreMatches() {
           usedCode = code;
           console.log(`   ✅ Found ${matches.length} matches with code ${code}`);
           break;
+        } else {
+          console.log(`   ℹ️ ${code} returned 0 matches`);
         }
       } catch (e) {
         console.log(`   ⚠️ ${code}: ${e.message}`);
+        if (e.response) {
+          console.log(`      Status: ${e.response.status}`);
+        }
         continue;
       }
     }
     
+    // If no matches from API, use demo matches
     if (matches.length === 0) {
       console.log("⚠️ No matches found from API, using demo matches");
       matches = getDemoMatches();
@@ -185,6 +204,7 @@ async function fetchAndStoreMatches() {
     
     // Clear existing matches
     await dbRun("DELETE FROM matches");
+    console.log("🗑️ Cleared existing matches");
     
     // Store in database
     let stored = 0;
@@ -193,8 +213,8 @@ async function fetchAndStoreMatches() {
       const homeTeam = normalizeTeam(match.homeTeam?.name || "TBD");
       const awayTeam = normalizeTeam(match.awayTeam?.name || "TBD");
       const status = match.status || "SCHEDULED";
-      const homeScore = match.score?.fullTime?.home || 0;
-      const awayScore = match.score?.fullTime?.away || 0;
+      const homeScore = match.score?.fullTime?.home !== null ? match.score.fullTime.home : 0;
+      const awayScore = match.score?.fullTime?.away !== null ? match.score.fullTime.away : 0;
       
       let winner = null;
       if (status === "FINISHED" && homeScore !== awayScore) {
@@ -209,19 +229,26 @@ async function fetchAndStoreMatches() {
           [match.id, homeTeam, awayTeam, startTime, status, homeScore, awayScore, winner]
         );
         stored++;
+        if (stored % 20 === 0) {
+          console.log(`   Progress: ${stored}/${matches.length} matches stored`);
+        }
       } catch (e) {
-        // Skip duplicates
+        console.log(`   ⚠️ Error storing match ${match.id}: ${e.message}`);
       }
     }
     
-    console.log(`💾 Stored ${stored} matches in database`);
+    console.log(`💾 Successfully stored ${stored} matches in database`);
+    
+    // Verify storage
+    const count = await dbGet("SELECT COUNT(*) as c FROM matches");
+    console.log(`📊 Database now has ${count.c} matches`);
     
   } catch (error) {
-    console.error("Error fetching matches:", error.message);
+    console.error("❌ Error in fetchAndStoreMatches:", error.message);
     
-    // Check if we have any matches
-    const count = await dbGet("SELECT COUNT(*) as count FROM matches");
-    if (!count || count.count === 0) {
+    // Fallback to demo matches
+    const count = await dbGet("SELECT COUNT(*) as c FROM matches");
+    if (!count || count.c === 0) {
       console.log("📋 Using demo matches as fallback");
       const matches = getDemoMatches();
       for (const match of matches) {
@@ -275,16 +302,16 @@ function formatMatch(row) {
       total: totalPool.toString()
     },
     odds,
-    bettingOpen: row.status === "SCHEDULED" || row.status === "TIMED"
+    bettingOpen: row.status === "SCHEDULED" || row.status === "TIMED" || row.status === "IN_PLAY"
   };
 }
 
-// ─── Express App ───────────────────────────────────────────────────────────
+// ─── API Endpoints ─────────────────────────────────────────────────────────
 
 // Root endpoint
 app.get("/", (req, res) => {
   res.json({
-    name: "World Cup 2026 API",
+    name: "World Cup 2026 Betting API",
     status: "running",
     environment: isVercel ? "vercel" : "local",
     endpoints: {
@@ -293,12 +320,15 @@ app.get("/", (req, res) => {
       match: "/api/matches/:id",
       stats: "/api/stats",
       leaderboard: "/api/leaderboard",
-      ultimate: "/api/ultimate"
+      ultimate: "/api/ultimate",
+      debug: "/api/debug",
+      "debug-fetch": "/api/debug-fetch",
+      "force-demo": "/api/force-demo"
     }
   });
 });
 
-// GET /api/health
+// Health check
 app.get("/api/health", async (req, res) => {
   try {
     const count = await dbGet("SELECT COUNT(*) as c FROM matches");
@@ -306,10 +336,15 @@ app.get("/api/health", async (req, res) => {
       status: "ok",
       matchesInDB: count?.c || 0,
       apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+      environment: isVercel ? "vercel" : "local",
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    res.json({ status: "ok", matchesInDB: 0 });
+    res.json({ 
+      status: "ok", 
+      matchesInDB: 0,
+      error: error.message
+    });
   }
 });
 
@@ -317,7 +352,10 @@ app.get("/api/health", async (req, res) => {
 app.get("/api/matches", async (req, res) => {
   try {
     const rows = await dbAll("SELECT * FROM matches ORDER BY start_time ASC");
-    res.json({ matches: rows.map(formatMatch) });
+    res.json({ 
+      matches: rows.map(formatMatch),
+      total: rows.length
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -367,7 +405,9 @@ app.get("/api/leaderboard", (req, res) => {
     leaderboard: [
       { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
       { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 },
-      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 }
+      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 },
+      { user: "0x4567...8901", total_wagered: "29000", bet_count: 15 },
+      { user: "0x5678...9012", total_wagered: "21000", bet_count: 12 }
     ]
   });
 });
@@ -382,16 +422,124 @@ app.get("/api/ultimate", (req, res) => {
     teamPools: [
       { team: "Brazil", amount: "45000" },
       { team: "Argentina", amount: "38000" },
-      { team: "France", amount: "32000" }
+      { team: "France", amount: "32000" },
+      { team: "Germany", amount: "28000" },
+      { team: "England", amount: "25000" }
     ]
   });
 });
 
-// POST /api/refresh - Manually refresh matches
-app.post("/api/refresh", async (req, res) => {
-  await fetchAndStoreMatches();
+// 🔍 DEBUG ENDPOINT - Test API connectivity
+app.get("/api/debug-fetch", async (req, res) => {
+  const results = {
+    apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+    apiKeyPrefix: FOOTBALL_API_KEY ? FOOTBALL_API_KEY.substring(0, 8) + "..." : "none",
+    timestamp: new Date().toISOString(),
+    tests: {},
+    database: {}
+  };
+  
+  // Test each competition
+  const codes = ['WC', 'PL', 'PD', 'BL1', 'SA', 'FL1', 'CL'];
+  
+  for (const code of codes) {
+    try {
+      const start = Date.now();
+      const response = await axios.get(
+        `${API_BASE}/competitions/${code}`,
+        { headers: API_HEADERS, timeout: 5000 }
+      );
+      results.tests[code] = {
+        success: true,
+        time: Date.now() - start + 'ms',
+        competition: response.data.name,
+        plan: response.data.plan,
+        available: true
+      };
+    } catch (e) {
+      results.tests[code] = {
+        success: false,
+        error: e.message,
+        status: e.response?.status,
+        statusText: e.response?.statusText
+      };
+    }
+  }
+  
+  // Test matches endpoint for WC
+  try {
+    const matchResponse = await axios.get(
+      `${API_BASE}/competitions/WC/matches`,
+      { headers: API_HEADERS, timeout: 5000 }
+    );
+    results.wcMatches = {
+      total: matchResponse.data.matches?.length || 0,
+      competition: matchResponse.data.competition?.name,
+      season: matchResponse.data.season
+    };
+  } catch (e) {
+    results.wcMatches = {
+      error: e.message,
+      status: e.response?.status
+    };
+  }
+  
+  // Check database
+  try {
+    const count = await dbGet("SELECT COUNT(*) as c FROM matches");
+    const sample = await dbGet("SELECT * FROM matches LIMIT 1");
+    results.database = {
+      matches: count?.c || 0,
+      hasSample: !!sample,
+      sampleMatch: sample ? {
+        id: sample.id,
+        home: sample.home_team,
+        away: sample.away_team
+      } : null
+    };
+  } catch (e) {
+    results.database = {
+      error: e.message
+    };
+  }
+  
+  res.json(results);
+});
+
+// 🚀 FORCE DEMO - Force load demo matches
+app.post("/api/force-demo", async (req, res) => {
+  const matches = getDemoMatches();
+  await dbRun("DELETE FROM matches");
+  
+  for (const match of matches) {
+    const startTime = Math.floor(new Date(match.utcDate).getTime() / 1000);
+    const homeScore = match.score?.fullTime?.home || 0;
+    const awayScore = match.score?.fullTime?.away || 0;
+    const winner = match.status === "FINISHED" && homeScore > awayScore ? match.homeTeam.name : 
+                  match.status === "FINISHED" && awayScore > homeScore ? match.awayTeam.name : null;
+    
+    await dbRun(
+      `INSERT INTO matches 
+       (id, home_team, away_team, start_time, status, home_score, away_score, winner)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [match.id, match.homeTeam.name, match.awayTeam.name, startTime,
+       match.status, homeScore, awayScore, winner]
+    );
+  }
+  
   const count = await dbGet("SELECT COUNT(*) as c FROM matches");
-  res.json({ success: true, matchesInDB: count?.c || 0 });
+  res.json({ 
+    success: true, 
+    message: "Demo matches loaded",
+    matchesInDB: count.c
+  });
+});
+
+// 🔄 Refresh matches
+app.post("/api/refresh", async (req, res) => {
+  res.json({ message: "Refresh started - check logs" });
+  // Don't await - let it run in background
+  fetchAndStoreMatches().catch(console.error);
 });
 
 // ─── Initialize on cold start ─────────────────────────────────────────────
@@ -399,19 +547,38 @@ async function initialize() {
   console.log("\n🚀 Starting World Cup API...");
   console.log(`📊 Environment: ${isVercel ? 'Vercel' : 'Local'}`);
   console.log(`🔑 API Key: ${FOOTBALL_API_KEY ? '✅' : '❌'}`);
+  console.log(`📁 Database: ${dbPath}`);
   
   try {
     const count = await dbGet("SELECT COUNT(*) as c FROM matches");
+    console.log(`📊 Current matches in DB: ${count?.c || 0}`);
     
     if (!count || count.c === 0) {
       console.log("🔄 No matches found, fetching initial data...");
       await fetchAndStoreMatches();
     } else {
-      console.log(`📊 Database already has ${count.c} matches`);
+      console.log(`✅ Database already has ${count.c} matches`);
     }
   } catch (error) {
-    console.error("Error initializing:", error);
-    await fetchAndStoreMatches();
+    console.error("❌ Error initializing:", error);
+    console.log("📋 Loading demo matches as fallback...");
+    const matches = getDemoMatches();
+    for (const match of matches) {
+      const startTime = Math.floor(new Date(match.utcDate).getTime() / 1000);
+      const homeScore = match.score?.fullTime?.home || 0;
+      const awayScore = match.score?.fullTime?.away || 0;
+      const winner = match.status === "FINISHED" && homeScore > awayScore ? match.homeTeam.name : 
+                    match.status === "FINISHED" && awayScore > homeScore ? match.awayTeam.name : null;
+      
+      await dbRun(
+        `INSERT OR REPLACE INTO matches 
+         (id, home_team, away_team, start_time, status, home_score, away_score, winner)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [match.id, match.homeTeam.name, match.awayTeam.name, startTime,
+         match.status, homeScore, awayScore, winner]
+      );
+    }
+    console.log("✅ Loaded demo matches");
   }
 }
 
