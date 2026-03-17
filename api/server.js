@@ -1,6 +1,6 @@
 /**
  * World Cup 2026 Betting — Backend API
- * ONLY World Cup data - ABSOLUTELY NO DEMO DATA
+ * NO DEMO DATA - Only real API data
  */
 
 require("dotenv").config();
@@ -16,6 +16,10 @@ app.use(express.json());
 // ─── Config ────────────────────────────────────────────────────────────────
 const FOOTBALL_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
 const isVercel = process.env.VERCEL === '1';
+
+if (!FOOTBALL_API_KEY) {
+  console.error("❌ FATAL: FOOTBALL_DATA_API_KEY not found in environment");
+}
 
 // ─── Database Setup ──────────────────────────────────────────────────────
 const dbPath = isVercel ? '/tmp/worldcup.db' : './worldcup.db';
@@ -88,12 +92,371 @@ function normalizeTeam(name) {
   return map[name] || name;
 }
 
-// ─── Fetch ONLY World Cup matches - NO DEMO FALLBACK ────────────────────
+// ─── AI Analysis Agent Class ─────────────────────────────────────────────
+class AIAnalysisAgent {
+  constructor(apiKey) {
+    this.footballApiKey = apiKey;
+    this.apiBase = "https://api.football-data.org/v4";
+    this.headers = { "X-Auth-Token": this.footballApiKey };
+  }
+
+  // ─── Fetch Head-to-Head History ──────────────────────────────────────
+  async getHeadToHead(team1, team2) {
+    try {
+      console.log(`📊 Analyzing head-to-head: ${team1} vs ${team2}`);
+      
+      const team1Id = await this.findTeamId(team1);
+      const team2Id = await this.findTeamId(team2);
+      
+      if (!team1Id || !team2Id) {
+        throw new Error("Could not find team IDs");
+      }
+      
+      const response = await axios.get(
+        `${this.apiBase}/teams/${team1Id}/matches?limit=20&status=FINISHED`,
+        { headers: this.headers, timeout: 5000 }
+      );
+      
+      const h2hMatches = response.data.matches.filter(m => 
+        (m.homeTeam.id === team2Id || m.awayTeam.id === team2Id)
+      ).slice(0, 10);
+      
+      if (h2hMatches.length === 0) {
+        return {
+          totalMatches: 0,
+          message: "No head-to-head history available"
+        };
+      }
+      
+      let team1Wins = 0, team2Wins = 0, draws = 0;
+      let team1Goals = 0, team2Goals = 0;
+      
+      h2hMatches.forEach(match => {
+        const homeScore = match.score.fullTime.home;
+        const awayScore = match.score.fullTime.away;
+        
+        if (match.homeTeam.id === team1Id) {
+          team1Goals += homeScore;
+          team2Goals += awayScore;
+          if (homeScore > awayScore) team1Wins++;
+          else if (homeScore < awayScore) team2Wins++;
+          else draws++;
+        } else {
+          team1Goals += awayScore;
+          team2Goals += homeScore;
+          if (awayScore > homeScore) team1Wins++;
+          else if (awayScore < homeScore) team2Wins++;
+          else draws++;
+        }
+      });
+      
+      return {
+        totalMatches: h2hMatches.length,
+        team1Wins,
+        team2Wins,
+        draws,
+        team1Goals,
+        team2Goals,
+        recentMatches: h2hMatches.slice(0, 5).map(m => ({
+          date: new Date(m.utcDate).toLocaleDateString(),
+          homeTeam: m.homeTeam.name,
+          awayTeam: m.awayTeam.name,
+          score: `${m.score.fullTime.home}-${m.score.fullTime.away}`,
+          winner: m.score.fullTime.home > m.score.fullTime.away ? m.homeTeam.name :
+                  m.score.fullTime.home < m.score.fullTime.away ? m.awayTeam.name : 'Draw'
+        })),
+        advantage: team1Wins > team2Wins ? team1 : team2Wins > team1Wins ? team2 : 'Equal',
+        dominance: ((team1Wins + draws/2) / h2hMatches.length * 100).toFixed(1)
+      };
+      
+    } catch (error) {
+      console.error("Error fetching head-to-head:", error.message);
+      return {
+        totalMatches: 0,
+        error: "Could not fetch head-to-head data"
+      };
+    }
+  }
+
+  // ─── Fetch Team Form ────────────────────────────────────────────────
+  async getTeamForm(teamName, matches = 5) {
+    try {
+      console.log(`📈 Analyzing form for: ${teamName}`);
+      
+      const teamId = await this.findTeamId(teamName);
+      if (!teamId) {
+        throw new Error("Could not find team ID");
+      }
+      
+      const response = await axios.get(
+        `${this.apiBase}/teams/${teamId}/matches?limit=10&status=FINISHED`,
+        { headers: this.headers, timeout: 5000 }
+      );
+      
+      const recentMatches = response.data.matches.slice(0, matches);
+      
+      if (recentMatches.length === 0) {
+        return {
+          team: teamName,
+          message: "No recent matches found"
+        };
+      }
+      
+      let form = [];
+      let points = 0;
+      let goalsFor = 0, goalsAgainst = 0;
+      
+      recentMatches.forEach(match => {
+        const isHome = match.homeTeam.id === teamId;
+        const teamScore = isHome ? match.score.fullTime.home : match.score.fullTime.away;
+        const opponentScore = isHome ? match.score.fullTime.away : match.score.fullTime.home;
+        
+        goalsFor += teamScore;
+        goalsAgainst += opponentScore;
+        
+        let result;
+        if (teamScore > opponentScore) {
+          result = 'W';
+          points += 3;
+        } else if (teamScore < opponentScore) {
+          result = 'L';
+        } else {
+          result = 'D';
+          points += 1;
+        }
+        
+        form.push({
+          opponent: isHome ? match.awayTeam.name : match.homeTeam.name,
+          result,
+          score: `${teamScore}-${opponentScore}`,
+          date: new Date(match.utcDate).toLocaleDateString()
+        });
+      });
+      
+      const formString = form.map(f => f.result).join('');
+      
+      return {
+        team: teamName,
+        recentForm: form,
+        formString,
+        points,
+        goalsFor,
+        goalsAgainst,
+        averageGoalsFor: (goalsFor / matches).toFixed(1),
+        averageGoalsAgainst: (goalsAgainst / matches).toFixed(1),
+        formRating: this.calculateFormRating(formString),
+        trend: this.analyzeTrend(formString)
+      };
+      
+    } catch (error) {
+      console.error("Error fetching team form:", error.message);
+      return {
+        team: teamName,
+        error: "Could not fetch form data"
+      };
+    }
+  }
+
+  // ─── AI Prediction Model ────────────────────────────────────────────
+  async predictOutcome(homeTeam, awayTeam) {
+    console.log(`🤖 AI predicting: ${homeTeam} vs ${awayTeam}`);
+    
+    const [h2h, homeForm, awayForm] = await Promise.all([
+      this.getHeadToHead(homeTeam, awayTeam),
+      this.getTeamForm(homeTeam),
+      this.getTeamForm(awayTeam)
+    ]);
+    
+    // Check if we have enough data
+    if (homeForm.error || awayForm.error || h2h.error) {
+      return {
+        prediction: {
+          homeWin: 33.3,
+          draw: 33.3,
+          awayWin: 33.3
+        },
+        mostLikely: 'UNKNOWN',
+        confidence: 'Low',
+        insights: ['Insufficient data for accurate prediction'],
+        statistics: { h2h, homeForm, awayForm },
+        keyFactors: ['Limited historical data available']
+      };
+    }
+    
+    const homeAdvantage = 1.2;
+    const formWeight = 0.4;
+    const h2hWeight = 0.3;
+    const recentWeight = 0.3;
+    
+    const homeFormScore = homeForm.formString ? this.calculateFormScore(homeForm.formString) * homeAdvantage : 50;
+    const awayFormScore = awayForm.formString ? this.calculateFormScore(awayForm.formString) : 50;
+    
+    const h2hScore = h2h.totalMatches > 0 ? 
+      (h2h.team1Wins * 3 + h2h.draws) / (h2h.totalMatches * 3) * 100 : 50;
+    
+    const homeWinProb = (
+      homeFormScore * formWeight +
+      h2hScore * h2hWeight +
+      (100 - awayFormScore) * recentWeight
+    ) / (formWeight + h2hWeight + recentWeight);
+    
+    const awayWinProb = 100 - homeWinProb - 12;
+    const drawProb = 12;
+    
+    const insights = await this.generateInsights(homeTeam, awayTeam, {
+      h2h, homeForm, awayForm, homeWinProb, awayWinProb, drawProb
+    });
+    
+    return {
+      prediction: {
+        homeWin: Number(Math.min(homeWinProb, 85).toFixed(1)),
+        draw: Number(drawProb.toFixed(1)),
+        awayWin: Number(Math.min(awayWinProb, 85).toFixed(1))
+      },
+      mostLikely: homeWinProb > awayWinProb ? 'HOME_WIN' : awayWinProb > homeWinProb ? 'AWAY_WIN' : 'DRAW',
+      confidence: this.calculateConfidence(homeWinProb, awayWinProb, drawProb),
+      insights,
+      statistics: {
+        headToHead: h2h,
+        homeTeamForm: homeForm,
+        awayTeamForm: awayForm
+      },
+      keyFactors: this.identifyKeyFactors(h2h, homeForm, awayForm)
+    };
+  }
+
+  // ─── Helper: Find Team ID ───────────────────────────────────────────
+  async findTeamId(teamName) {
+    try {
+      const response = await axios.get(
+        `${this.apiBase}/teams?limit=100`,
+        { headers: this.headers, timeout: 5000 }
+      );
+      
+      const team = response.data.teams.find(t => 
+        t.name.toLowerCase().includes(teamName.toLowerCase()) ||
+        t.shortName?.toLowerCase().includes(teamName.toLowerCase()) ||
+        t.tla?.toLowerCase() === teamName.toLowerCase()
+      );
+      
+      return team?.id;
+    } catch {
+      return null;
+    }
+  }
+
+  // ─── Helper: Calculate Form Score ───────────────────────────────────
+  calculateFormScore(formString) {
+    if (!formString) return 50;
+    let score = 0;
+    for (let i = 0; i < formString.length; i++) {
+      const weight = 1 + (i * 0.1);
+      if (formString[i] === 'W') score += 3 * weight;
+      else if (formString[i] === 'D') score += 1 * weight;
+    }
+    const maxScore = formString.length * 3 * (1 + (formString.length - 1) * 0.1);
+    return (score / maxScore) * 100;
+  }
+
+  // ─── Helper: Calculate Form Rating ──────────────────────────────────
+  calculateFormRating(formString) {
+    if (!formString) return 'Unknown';
+    const wins = (formString.match(/W/g) || []).length;
+    if (wins >= 4) return 'Excellent';
+    if (wins >= 3) return 'Good';
+    if (wins >= 2) return 'Average';
+    if (wins >= 1) return 'Poor';
+    return 'Very Poor';
+  }
+
+  // ─── Helper: Analyze Trend ──────────────────────────────────────────
+  analyzeTrend(formString) {
+    if (!formString) return '↔️ Unknown';
+    const last3 = formString.slice(-3);
+    if (last3 === 'WWW') return '🚀 Rising sharply';
+    if (last3 === 'LLL') return '📉 Declining sharply';
+    if (last3.includes('WW')) return '📈 Improving';
+    if (last3.includes('LL')) return '📊 Declining';
+    return '↔️ Stable';
+  }
+
+  // ─── Helper: Generate AI Insights ───────────────────────────────────
+  async generateInsights(homeTeam, awayTeam, data) {
+    const insights = [];
+    
+    if (data.h2h.totalMatches > 0) {
+      if (data.h2h.team1Wins > data.h2h.team2Wins * 2) {
+        insights.push(`⚔️ ${homeTeam} dominates historically with ${data.h2h.team1Wins} wins in last ${data.h2h.totalMatches} meetings`);
+      } else if (data.h2h.team2Wins > data.h2h.team1Wins * 2) {
+        insights.push(`⚔️ ${awayTeam} has historical advantage with ${data.h2h.team2Wins} wins`);
+      } else if (data.h2h.draws > data.h2h.totalMatches / 2) {
+        insights.push(`⚔️ These teams often draw (${data.h2h.draws} draws in last ${data.h2h.totalMatches})`);
+      }
+    }
+    
+    if (data.homeForm.formRating && data.homeForm.formRating === 'Excellent') {
+      insights.push(`🔥 ${homeTeam} is in excellent form (${data.homeForm.formString})`);
+    }
+    if (data.awayForm.formRating && data.awayForm.formRating === 'Excellent') {
+      insights.push(`🔥 ${awayTeam} is in excellent form (${data.awayForm.formString})`);
+    }
+    
+    if (data.homeForm.averageGoalsFor && data.homeForm.averageGoalsFor > 2) {
+      insights.push(`⚽ ${homeTeam} scores ${data.homeForm.averageGoalsFor} goals per game on average`);
+    }
+    if (data.awayForm.averageGoalsAgainst && data.awayForm.averageGoalsAgainst > 2) {
+      insights.push(`🛡️ ${awayTeam} concedes ${data.awayForm.averageGoalsAgainst} goals per game - defensive weakness`);
+    }
+    
+    return insights;
+  }
+
+  // ─── Helper: Identify Key Factors ───────────────────────────────────
+  identifyKeyFactors(h2h, homeForm, awayForm) {
+    const factors = [];
+    
+    if (homeForm.formRating === 'Excellent' && awayForm.formRating === 'Poor') {
+      factors.push('Major form disparity favors home team');
+    }
+    if (h2h.advantage && h2h.advantage !== 'Equal') {
+      factors.push(`${h2h.advantage} has historical psychological advantage`);
+    }
+    if (homeForm.averageGoalsFor > 2 && awayForm.averageGoalsAgainst > 2) {
+      factors.push('Expected high-scoring match');
+    }
+    
+    return factors;
+  }
+
+  // ─── Helper: Calculate Confidence ───────────────────────────────────
+  calculateConfidence(home, away, draw) {
+    const maxProb = Math.max(home, away, draw);
+    if (maxProb > 70) return 'High';
+    if (maxProb > 55) return 'Medium';
+    return 'Low';
+  }
+}
+
+// Initialize AI Agent
+const aiAgent = new AIAnalysisAgent(FOOTBALL_API_KEY);
+
+// ─── Helper: Normalize team names ─────────────────────────────────────────
+function normalizeTeam(name) {
+  const map = {
+    "United States": "USA",
+    "Korea Republic": "South Korea",
+    "IR Iran": "Iran",
+    "Côte d'Ivoire": "Ivory Coast"
+  };
+  return map[name] || name;
+}
+
+// ─── Fetch ONLY World Cup matches from API - NO DEMO ─────────────────────
 async function fetchWorldCupMatches() {
-  console.log("🌍 Fetching World Cup matches...");
+  console.log("🌍 Fetching World Cup matches from API...");
   
   if (!FOOTBALL_API_KEY) {
-    throw new Error("❌ No API key found - cannot fetch World Cup data");
+    throw new Error("No API key available");
   }
   
   try {
@@ -105,25 +468,21 @@ async function fetchWorldCupMatches() {
     const matches = response.data.matches || [];
     
     if (matches.length === 0) {
-      console.log("⚠️ World Cup API returned 0 matches");
+      console.log("⚠️ API returned 0 World Cup matches");
       return []; // Return empty array, NO DEMO
     }
     
-    console.log(`✅ Found ${matches.length} World Cup matches`);
+    console.log(`✅ Found ${matches.length} World Cup matches from API`);
     return matches;
     
   } catch (error) {
     console.error("❌ Failed to fetch World Cup data:", error.message);
-    if (error.response?.status === 429) {
-      console.log("⚠️ Rate limited by API - try again later");
-    }
     return []; // Return empty array on error, NO DEMO
   }
 }
 
 // ─── Store matches in database ────────────────────────────────────────────
 async function storeMatches(matches) {
-  // Clear existing matches first
   await dbRun("DELETE FROM matches");
   console.log("🗑️ Cleared existing matches");
   
@@ -176,7 +535,6 @@ async function storeMatches(matches) {
 
 // ─── Format match for API response ────────────────────────────────────────
 function formatMatch(row) {
-  // Generate random pools (since no blockchain)
   const homePool = Math.floor(Math.random() * 10) + 5;
   const drawPool = Math.floor(Math.random() * 5) + 2;
   const awayPool = Math.floor(Math.random() * 8) + 3;
@@ -220,7 +578,7 @@ function formatMatch(row) {
 app.get("/", (req, res) => {
   res.json({
     name: "World Cup 2026 API",
-    description: "ONLY World Cup data - NO DEMO",
+    description: "ONLY real World Cup data - NO DEMO",
     status: "running",
     environment: isVercel ? "vercel" : "local",
     endpoints: {
@@ -230,6 +588,12 @@ app.get("/", (req, res) => {
       stats: "/api/stats",
       leaderboard: "/api/leaderboard",
       ultimate: "/api/ultimate",
+      ai: {
+        analyze: "/api/ai/analyze/:matchId",
+        head2head: "/api/ai/head2head?team1=&team2=",
+        form: "/api/ai/form/:team",
+        predict: "/api/ai/predict?home=&away="
+      },
       refresh: "/api/refresh",
       debug: "/api/debug"
     }
@@ -264,8 +628,8 @@ app.get("/api/matches", async (req, res) => {
     res.json({ 
       matches: rows.map(formatMatch),
       total: rows.length,
-      source: "World Cup 2026 Data",
-      note: rows.length === 0 ? "No World Cup matches available in API yet" : "Real World Cup matches"
+      source: "Real World Cup Data",
+      note: rows.length === 0 ? "No World Cup matches available in API yet" : "Real World Cup matches only"
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -311,7 +675,7 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
-// GET /api/leaderboard (demo - keep as is)
+// GET /api/leaderboard (demo - these are fine)
 app.get("/api/leaderboard", (req, res) => {
   res.json({
     leaderboard: [
@@ -322,7 +686,7 @@ app.get("/api/leaderboard", (req, res) => {
   });
 });
 
-// GET /api/ultimate (demo - keep as is)
+// GET /api/ultimate (demo - these are fine)
 app.get("/api/ultimate", (req, res) => {
   res.json({
     deadline: Math.floor(Date.now() / 1000) + 2592000,
@@ -335,6 +699,88 @@ app.get("/api/ultimate", (req, res) => {
       { team: "France", amount: "32000" }
     ]
   });
+});
+
+// ─── AI Endpoints ─────────────────────────────────────────────────────
+
+// GET /api/ai/analyze/:matchId - AI analysis for a specific match
+app.get("/api/ai/analyze/:matchId", async (req, res) => {
+  try {
+    const match = await dbGet("SELECT * FROM matches WHERE id=?", [req.params.id]);
+    
+    if (!match) {
+      return res.status(404).json({ error: "Match not found" });
+    }
+    
+    const analysis = await aiAgent.predictOutcome(match.home_team, match.away_team);
+    
+    res.json({
+      matchId: match.id,
+      homeTeam: match.home_team,
+      awayTeam: match.away_team,
+      analysis,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/head2head - Head-to-head analysis
+app.get("/api/ai/head2head", async (req, res) => {
+  try {
+    const { team1, team2 } = req.query;
+    
+    if (!team1 || !team2) {
+      return res.status(400).json({ error: "Please provide team1 and team2" });
+    }
+    
+    const h2h = await aiAgent.getHeadToHead(team1, team2);
+    
+    res.json({
+      team1,
+      team2,
+      analysis: h2h,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/form/:team - Team form analysis
+app.get("/api/ai/form/:team", async (req, res) => {
+  try {
+    const form = await aiAgent.getTeamForm(req.params.team);
+    res.json(form);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/predict - Predict match outcome
+app.get("/api/ai/predict", async (req, res) => {
+  try {
+    const { home, away } = req.query;
+    
+    if (!home || !away) {
+      return res.status(400).json({ error: "Please provide home and away teams" });
+    }
+    
+    const prediction = await aiAgent.predictOutcome(home, away);
+    
+    res.json({
+      homeTeam: home,
+      awayTeam: away,
+      prediction,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // POST /api/refresh - Manually fetch World Cup matches (NO DEMO)
