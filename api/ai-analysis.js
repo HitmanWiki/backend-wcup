@@ -1,21 +1,16 @@
 /**
  * AI Match Analysis Agent
- * Provides head-to-head, form analysis, and predictions
+ * Fixed ES Module import issue
  */
 
 const axios = require('axios');
-const Natural = require('natural');
-const sentiment = require('sentiment');
 
+// Remove problematic imports - we'll implement our own simple sentiment
 class AIAnalysisAgent {
   constructor(apiKey) {
     this.footballApiKey = apiKey;
     this.apiBase = "https://api.football-data.org/v4";
     this.headers = { "X-Auth-Token": this.footballApiKey };
-    
-    // Initialize NLP tools
-    this.tokenizer = new Natural.WordTokenizer();
-    this.tfidf = new Natural.TfIdf();
   }
 
   // ─── Fetch Head-to-Head History ──────────────────────────────────────
@@ -23,7 +18,6 @@ class AIAnalysisAgent {
     try {
       console.log(`📊 Analyzing head-to-head: ${team1} vs ${team2}`);
       
-      // Search for team IDs
       const team1Id = await this.findTeamId(team1);
       const team2Id = await this.findTeamId(team2);
       
@@ -31,21 +25,19 @@ class AIAnalysisAgent {
         return this.generateMockHeadToHead(team1, team2);
       }
       
-      // Fetch head-to-head matches
       const response = await axios.get(
-        `${this.apiBase}/teams/${team1Id}/matches?limit=10&status=FINISHED`,
+        `${this.apiBase}/teams/${team1Id}/matches?limit=20&status=FINISHED`,
         { headers: this.headers, timeout: 5000 }
       );
       
       const h2hMatches = response.data.matches.filter(m => 
         (m.homeTeam.id === team2Id || m.awayTeam.id === team2Id)
-      );
+      ).slice(0, 10);
       
       if (h2hMatches.length === 0) {
         return this.generateMockHeadToHead(team1, team2);
       }
       
-      // Analyze results
       let team1Wins = 0, team2Wins = 0, draws = 0;
       let team1Goals = 0, team2Goals = 0;
       
@@ -110,6 +102,10 @@ class AIAnalysisAgent {
       
       const recentMatches = response.data.matches.slice(0, matches);
       
+      if (recentMatches.length === 0) {
+        return this.generateMockForm(teamName);
+      }
+      
       let form = [];
       let points = 0;
       let goalsFor = 0, goalsAgainst = 0;
@@ -166,51 +162,41 @@ class AIAnalysisAgent {
   async predictOutcome(homeTeam, awayTeam) {
     console.log(`🤖 AI predicting: ${homeTeam} vs ${awayTeam}`);
     
-    // Fetch all data
     const [h2h, homeForm, awayForm] = await Promise.all([
       this.getHeadToHead(homeTeam, awayTeam),
       this.getTeamForm(homeTeam),
       this.getTeamForm(awayTeam)
     ]);
     
-    // Calculate weights
-    const homeAdvantage = 1.2; // Home advantage multiplier
+    const homeAdvantage = 1.2;
     const formWeight = 0.4;
     const h2hWeight = 0.3;
     const recentWeight = 0.3;
     
-    // Calculate scores
     const homeFormScore = this.calculateFormScore(homeForm.formString) * homeAdvantage;
     const awayFormScore = this.calculateFormScore(awayForm.formString);
     
     const h2hScore = h2h.totalMatches > 0 ? 
       (h2h.team1Wins * 3 + h2h.draws) / (h2h.totalMatches * 3) * 100 : 50;
     
-    // Weighted prediction
     const homeWinProb = (
       homeFormScore * formWeight +
       h2hScore * h2hWeight +
       (100 - awayFormScore) * recentWeight
     ) / (formWeight + h2hWeight + recentWeight);
     
-    const awayWinProb = 100 - homeWinProb - 10; // Leave room for draw
-    const drawProb = 10; // Base draw probability
+    const awayWinProb = 100 - homeWinProb - 10;
+    const drawProb = 10;
     
-    // Generate insights
-    const insights = await this.generateInsights(homeTeam, awayTeam, {
-      h2h,
-      homeForm,
-      awayForm,
-      homeWinProb,
-      awayWinProb,
-      drawProb
+    const insights = this.generateInsights(homeTeam, awayTeam, {
+      h2h, homeForm, awayForm, homeWinProb, awayWinProb, drawProb
     });
     
     return {
       prediction: {
-        homeWin: Number(homeWinProb.toFixed(1)),
+        homeWin: Number(Math.min(homeWinProb, 85).toFixed(1)),
         draw: Number(drawProb.toFixed(1)),
-        awayWin: Number(awayWinProb.toFixed(1))
+        awayWin: Number(Math.min(awayWinProb, 85).toFixed(1))
       },
       mostLikely: homeWinProb > awayWinProb ? 'HOME_WIN' : awayWinProb > homeWinProb ? 'AWAY_WIN' : 'DRAW',
       confidence: this.calculateConfidence(homeWinProb, awayWinProb, drawProb),
@@ -228,7 +214,7 @@ class AIAnalysisAgent {
   async findTeamId(teamName) {
     try {
       const response = await axios.get(
-        `${this.apiBase}/teams?limit=50`,
+        `${this.apiBase}/teams?limit=100`,
         { headers: this.headers, timeout: 5000 }
       );
       
@@ -246,9 +232,10 @@ class AIAnalysisAgent {
 
   // ─── Helper: Calculate Form Score ───────────────────────────────────
   calculateFormScore(formString) {
+    if (!formString) return 50;
     let score = 0;
     for (let i = 0; i < formString.length; i++) {
-      const weight = 1 + (i * 0.1); // Recent matches weighted more
+      const weight = 1 + (i * 0.1);
       if (formString[i] === 'W') score += 3 * weight;
       else if (formString[i] === 'D') score += 1 * weight;
     }
@@ -258,10 +245,8 @@ class AIAnalysisAgent {
 
   // ─── Helper: Calculate Form Rating ──────────────────────────────────
   calculateFormRating(formString) {
+    if (!formString) return 'Unknown';
     const wins = (formString.match(/W/g) || []).length;
-    const draws = (formString.match(/D/g) || []).length;
-    const losses = (formString.match(/L/g) || []).length;
-    
     if (wins >= 4) return 'Excellent';
     if (wins >= 3) return 'Good';
     if (wins >= 2) return 'Average';
@@ -271,6 +256,7 @@ class AIAnalysisAgent {
 
   // ─── Helper: Analyze Trend ──────────────────────────────────────────
   analyzeTrend(formString) {
+    if (!formString) return '↔️ Unknown';
     const last3 = formString.slice(-3);
     if (last3 === 'WWW') return '🚀 Rising sharply';
     if (last3 === 'LLL') return '📉 Declining sharply';
@@ -280,10 +266,9 @@ class AIAnalysisAgent {
   }
 
   // ─── Helper: Generate AI Insights ───────────────────────────────────
-  async generateInsights(homeTeam, awayTeam, data) {
+  generateInsights(homeTeam, awayTeam, data) {
     const insights = [];
     
-    // Head-to-head insight
     if (data.h2h.totalMatches > 0) {
       if (data.h2h.team1Wins > data.h2h.team2Wins * 2) {
         insights.push(`⚔️ ${homeTeam} dominates historically with ${data.h2h.team1Wins} wins in last ${data.h2h.totalMatches} meetings`);
@@ -294,7 +279,6 @@ class AIAnalysisAgent {
       }
     }
     
-    // Form insights
     if (data.homeForm.formRating === 'Excellent') {
       insights.push(`🔥 ${homeTeam} is in excellent form (${data.homeForm.formString})`);
     }
@@ -302,12 +286,15 @@ class AIAnalysisAgent {
       insights.push(`🔥 ${awayTeam} is in excellent form (${data.awayForm.formString})`);
     }
     
-    // Goal insights
     if (data.homeForm.averageGoalsFor > 2) {
       insights.push(`⚽ ${homeTeam} scores ${data.homeForm.averageGoalsFor} goals per game on average`);
     }
     if (data.awayForm.averageGoalsAgainst > 2) {
       insights.push(`🛡️ ${awayTeam} concedes ${data.awayForm.averageGoalsAgainst} goals per game - defensive weakness`);
+    }
+    
+    if (data.homeWinProb > 65) {
+      insights.push(`📊 Strong home advantage predicted for ${homeTeam}`);
     }
     
     return insights;
@@ -320,11 +307,16 @@ class AIAnalysisAgent {
     if (homeForm.formRating === 'Excellent' && awayForm.formRating === 'Poor') {
       factors.push('Major form disparity favors home team');
     }
-    if (h2h.advantage !== 'Equal') {
+    if (h2h.advantage && h2h.advantage !== 'Equal') {
       factors.push(`${h2h.advantage} has historical psychological advantage`);
     }
     if (homeForm.averageGoalsFor > 2 && awayForm.averageGoalsAgainst > 2) {
       factors.push('Expected high-scoring match');
+    }
+    if (homeForm.formString && awayForm.formString) {
+      if (homeForm.formString.includes('WW') && awayForm.formString.includes('LL')) {
+        factors.push('Momentum heavily with home team');
+      }
     }
     
     return factors;
