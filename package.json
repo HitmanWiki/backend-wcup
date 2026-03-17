@@ -1,0 +1,17 @@
+{
+  "name": "worldcup-backend",
+  "version": "1.0.0",
+  "description": "World Cup 2026 Betting Backend",
+  "main": "api/server.js",
+  "scripts": {
+    "dev": "node api/server.js",
+    "vercel-build": "echo \"Building for Vercel\""
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "axios": "^1.6.0",
+    "better-sqlite3": "^9.0.0",
+    "dotenv": "^16.3.1"
+  }
+}
