@@ -1,654 +1,759 @@
 /**
- * AI Match Analysis Agent
- * Professional-grade football match predictor
+ * AI Match Analysis Agent — Gemini Edition
+ * Brain  : Google Gemini 2.0 Flash (free tier)
+ * Data   : football-data.org  +  NewsAPI (both free tiers available)
+ * Pattern: Agentic loop — Gemini decides which tools to call and when
+ *
+ * Setup:
+ *   npm install @google/generative-ai axios
+ *   GEMINI_API_KEY=...        (https://aistudio.google.com/app/apikey)
+ *   FOOTBALL_API_KEY=...      (https://www.football-data.org — free tier)
+ *   NEWS_API_KEY=...          (https://newsapi.org — free tier, optional)
  */
 
-const axios = require('axios');
+const axios = require("axios");
+const { GoogleGenerativeAI, SchemaType } = require("@google/generative-ai");
 
-class AIAnalysisAgent {
-  constructor(apiKey) {
-    this.footballApiKey = apiKey;
+class AIMatchAgent {
+  constructor({ footballApiKey, geminiApiKey, newsApiKey = null }) {
+    // ── Clients ────────────────────────────────────────────────────────
+    this.genAI = new GoogleGenerativeAI(geminiApiKey);
+    this.footballApiKey = footballApiKey;
+    this.newsApiKey = newsApiKey;
+
     this.apiBase = "https://api.football-data.org/v4";
-    this.headers = { "X-Auth-Token": this.footballApiKey };
-    
-    // Cache for team IDs to reduce API calls
-    this.teamCache = new Map();
-    
-    // Configuration for predictions - easily tunable
+    this.footballHeaders = { "X-Auth-Token": this.footballApiKey };
+
+    // ── Caches ─────────────────────────────────────────────────────────
+    this.teamCache = new Map();      // teamName → teamId
+    this.resultCache = new Map();    // cacheKey → { data, expiresAt }
+    this.CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
+    // ── Agent config ───────────────────────────────────────────────────
+    this.model = "gemini-2.0-flash";
+    this.maxIterations = 10;
     this.config = {
-      homeAdvantage: 1.25,        // Home advantage multiplier
-      weights: {
-        form: 0.4,                 // Recent form weight
-        h2h: 0.3,                  // Head-to-head weight
-        recent: 0.3                 // Recent meetings weight
-      },
-      baseDrawProb: 24,             // Base draw probability (in %)
-      minDataThreshold: 3,           // Minimum matches needed for reliable data
-      formMatchLimit: 6,             // Number of recent matches to analyze
-      h2hMatchLimit: 8               // Number of historical matches to analyze
+      homeAdvantage: 1.25,
+      formMatchLimit: 6,
+      h2hMatchLimit: 8,
+      minDataThreshold: 3,
     };
+
+    // ── Tool declarations (Gemini function-calling format) ─────────────
+    this.toolDeclarations = [
+      {
+        name: "get_team_form",
+        description:
+          "Fetch a team's recent match results — form string (e.g. WWDLW), goals scored/conceded, clean sheets, momentum, and weighted form score. Call this for BOTH home and away teams before doing anything else.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            team_name: {
+              type: SchemaType.STRING,
+              description: "Full or common name of the team, e.g. 'Manchester City'",
+            },
+            num_matches: {
+              type: SchemaType.INTEGER,
+              description: "Number of recent matches to analyse (default 6, max 10)",
+            },
+          },
+          required: ["team_name"],
+        },
+      },
+      {
+        name: "get_head_to_head",
+        description:
+          "Fetch historical head-to-head results between two teams: wins, draws, losses, goals, dominance score, and the most recent meetings. Call this after fetching individual team forms.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            team1: {
+              type: SchemaType.STRING,
+              description: "Home team name",
+            },
+            team2: {
+              type: SchemaType.STRING,
+              description: "Away team name",
+            },
+          },
+          required: ["team1", "team2"],
+        },
+      },
+      {
+        name: "get_league_standings",
+        description:
+          "Fetch current league table standings. Useful to understand a team's position, points gap, and league trajectory.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            competition_code: {
+              type: SchemaType.STRING,
+              description:
+                "Code: PL (Premier League), PD (La Liga), BL1 (Bundesliga), SA (Serie A), FL1 (Ligue 1), CL (Champions League)",
+            },
+          },
+          required: ["competition_code"],
+        },
+      },
+      {
+        name: "search_team_news",
+        description:
+          "Search for recent news about a team — injuries, suspensions, lineup hints, manager comments, squad rotation. Enrich prediction with context the stats alone cannot provide.",
+        parameters: {
+          type: SchemaType.OBJECT,
+          properties: {
+            query: {
+              type: SchemaType.STRING,
+              description:
+                "Search query, e.g. 'Manchester City injuries lineup 2025' or 'Arsenal suspension team news'",
+            },
+          },
+          required: ["query"],
+        },
+      },
+    ];
   }
 
-  // ─── Validate Input ─────────────────────────────────────────────────
-  validateTeamName(teamName) {
-    if (!teamName || typeof teamName !== 'string') {
-      throw new Error('Invalid team name');
-    }
-    return teamName.trim();
-  }
+  // ════════════════════════════════════════════════════════════════════
+  //  PUBLIC ENTRY POINT
+  // ════════════════════════════════════════════════════════════════════
 
-  // ─── Find Team ID with Caching ──────────────────────────────────────
-  async findTeamId(teamName) {
-    try {
-      teamName = this.validateTeamName(teamName);
-      
-      // Check cache first
-      if (this.teamCache.has(teamName)) {
-        console.log(`🔍 Cache hit for ${teamName}`);
-        return this.teamCache.get(teamName);
+  /**
+   * Run the full agentic prediction loop.
+   * Gemini decides which tools to call, in what order, how many times.
+   *
+   * @param {string} homeTeam
+   * @param {string} awayTeam
+   * @param {object} options  { competition?: string, verbose?: boolean }
+   * @returns {Promise<PredictionResult>}
+   */
+  async predict(homeTeam, awayTeam, options = {}) {
+    const { competition = "Unknown", verbose = false } = options;
+
+    this._log(`\n${"═".repeat(60)}`);
+    this._log(`🤖  Gemini Agent: ${homeTeam}  vs  ${awayTeam}`);
+    this._log(`${"═".repeat(60)}\n`);
+
+    // Initialise Gemini model with tools
+    const model = this.genAI.getGenerativeModel({
+      model: this.model,
+      tools: [{ functionDeclarations: this.toolDeclarations }],
+      systemInstruction: this._systemPrompt(),
+    });
+
+    // Start a chat session — Gemini maintains history internally
+    const chat = model.startChat({ history: [] });
+
+    // First user message
+    const firstMessage = this._buildPrompt(homeTeam, awayTeam, competition);
+    let response = await chat.sendMessage(firstMessage);
+
+    let iterations = 0;
+    let finalText = null;
+
+    // ── Agentic loop ──────────────────────────────────────────────────
+    while (iterations < this.maxIterations) {
+      iterations++;
+      this._log(`\n── Iteration ${iterations} ──────────────────────────────────`);
+
+      const candidate = response.response.candidates?.[0];
+      if (!candidate) {
+        this._log("⚠️  No candidates returned");
+        break;
       }
-      
-      console.log(`🔍 Searching for team: ${teamName}`);
-      
-      // Try exact match search first (more efficient)
-      try {
-        const searchResponse = await axios.get(
-          `${this.apiBase}/teams?name=${encodeURIComponent(teamName)}`,
-          { headers: this.headers, timeout: 5000 }
-        );
-        
-        if (searchResponse.data.teams && searchResponse.data.teams.length > 0) {
-          const team = searchResponse.data.teams[0];
-          this.teamCache.set(teamName, team.id);
-          return team.id;
+
+      const parts = candidate.content?.parts || [];
+      const functionCalls = parts.filter((p) => p.functionCall);
+      const textParts = parts.filter((p) => p.text);
+
+      // ── Case 1: Gemini wants to call tools ────────────────────────
+      if (functionCalls.length > 0) {
+        const toolResponses = [];
+
+        for (const part of functionCalls) {
+          const { name, args } = part.functionCall;
+          this._log(`\n🔧  Tool called: ${name}`);
+          if (verbose) this._log(`   Args: ${JSON.stringify(args, null, 2)}`);
+
+          let result;
+          try {
+            result = await this._dispatchTool(name, args);
+          } catch (err) {
+            result = { error: err.message };
+          }
+
+          if (verbose) this._log(`   Result: ${JSON.stringify(result, null, 2)}`);
+          else this._log(`   ✓ Done (${Object.keys(result).length} fields)`);
+
+          toolResponses.push({
+            functionResponse: {
+              name,
+              response: { content: result },
+            },
+          });
         }
-      } catch (e) {
-        // Fall back to full list search
+
+        // Send all tool results back in one turn
+        response = await chat.sendMessage(toolResponses);
+        continue;
       }
-      
-      // Fallback: fetch full list and fuzzy match
-      const response = await axios.get(
-        `${this.apiBase}/teams?limit=200`,
-        { headers: this.headers, timeout: 5000 }
-      );
-      
-      const teams = response.data.teams || [];
-      
-      // Try multiple matching strategies
-      const matchTeam = (team) => {
-        const nameLower = teamName.toLowerCase();
-        return (
-          team.name?.toLowerCase() === nameLower ||
-          team.shortName?.toLowerCase() === nameLower ||
-          team.tla?.toLowerCase() === nameLower ||
-          team.name?.toLowerCase().includes(nameLower) ||
-          (team.shortName && team.shortName.toLowerCase().includes(nameLower))
+
+      // ── Case 2: Gemini finished reasoning ────────────────────────
+      if (textParts.length > 0) {
+        finalText = textParts.map((p) => p.text).join("");
+        this._log(`\n✅  Agent finished after ${iterations} iteration(s)`);
+        break;
+      }
+
+      // ── Case 3: Finish reason other than normal ───────────────────
+      const finishReason = candidate.finishReason;
+      this._log(`⚠️  Finish reason: ${finishReason}`);
+      break;
+    }
+
+    if (!finalText) {
+      return this._fallbackResult(homeTeam, awayTeam);
+    }
+
+    return this._parseGeminiOutput(finalText, homeTeam, awayTeam);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  TOOL DISPATCHER
+  // ════════════════════════════════════════════════════════════════════
+
+  async _dispatchTool(name, args) {
+    switch (name) {
+      case "get_team_form":
+        return this._getTeamForm(
+          args.team_name,
+          args.num_matches || this.config.formMatchLimit
         );
+      case "get_head_to_head":
+        return this._getHeadToHead(args.team1, args.team2);
+      case "get_league_standings":
+        return this._getLeagueStandings(args.competition_code);
+      case "search_team_news":
+        return this._searchTeamNews(args.query);
+      default:
+        throw new Error(`Unknown tool: ${name}`);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  TOOL IMPLEMENTATIONS
+  // ════════════════════════════════════════════════════════════════════
+
+  async _getTeamForm(teamName, numMatches = 6) {
+    const cacheKey = `form:${teamName}:${numMatches}`;
+    const cached = this._getCache(cacheKey);
+    if (cached) return cached;
+
+    const teamId = await this._findTeamId(teamName);
+    if (!teamId) {
+      this._log(`   ⚠️  Team not found: ${teamName}, using mock`);
+      return this._mockForm(teamName, numMatches);
+    }
+
+    const resp = await axios.get(
+      `${this.apiBase}/teams/${teamId}/matches?limit=20&status=FINISHED`,
+      { headers: this.footballHeaders, timeout: 8000 }
+    );
+
+    const matches = (resp.data.matches || []).slice(0, numMatches);
+    if (matches.length === 0) return this._mockForm(teamName, numMatches);
+
+    let wins = 0, draws = 0, losses = 0;
+    let goalsFor = 0, goalsAgainst = 0, cleanSheets = 0;
+    const form = [];
+
+    matches.forEach((m, i) => {
+      const isHome = m.homeTeam.id === teamId;
+      const gf = isHome ? m.score.fullTime.home : m.score.fullTime.away;
+      const ga = isHome ? m.score.fullTime.away : m.score.fullTime.home;
+
+      goalsFor += gf;
+      goalsAgainst += ga;
+      if (ga === 0) cleanSheets++;
+
+      let result;
+      if (gf > ga) { result = "W"; wins++; }
+      else if (gf < ga) { result = "L"; losses++; }
+      else { result = "D"; draws++; }
+
+      form.push({
+        matchday: i + 1,
+        opponent: isHome ? m.awayTeam.name : m.homeTeam.name,
+        venue: isHome ? "H" : "A",
+        result,
+        score: `${gf}-${ga}`,
+        date: m.utcDate.split("T")[0],
+        goalDiff: gf - ga,
+      });
+    });
+
+    const n = matches.length;
+    const formString = form.map((f) => f.result).join("");
+
+    // Recency-weighted form score (newest = highest weight)
+    let weightedPts = 0, totalWeight = 0;
+    form.forEach((f, i) => {
+      const w = n - i;
+      totalWeight += w * 3;
+      if (f.result === "W") weightedPts += w * 3;
+      else if (f.result === "D") weightedPts += w;
+    });
+    const formScore = totalWeight > 0 ? (weightedPts / totalWeight) * 100 : 50;
+
+    const last3 = form.slice(0, 3).map((f) => f.result);
+    const momentum =
+      last3.filter((r) => r === "W").length >= 2 ? "positive" :
+      last3.filter((r) => r === "L").length >= 2 ? "negative" : "neutral";
+
+    const result = {
+      team: teamName,
+      formString,
+      formScore: +formScore.toFixed(1),
+      record: { wins, draws, losses, points: wins * 3 + draws, maxPoints: n * 3 },
+      goals: {
+        scored: goalsFor,
+        conceded: goalsAgainst,
+        avgScored: +(goalsFor / n).toFixed(2),
+        avgConceded: +(goalsAgainst / n).toFixed(2),
+        cleanSheets,
+        cleanSheetRate: +((cleanSheets / n) * 100).toFixed(1),
+      },
+      momentum,
+      recentMatches: form,
+      isMock: false,
+    };
+
+    this._setCache(cacheKey, result);
+    return result;
+  }
+
+  async _getHeadToHead(team1Name, team2Name) {
+    const cacheKey = `h2h:${team1Name}:${team2Name}`;
+    const cached = this._getCache(cacheKey);
+    if (cached) return cached;
+
+    const [team1Id, team2Id] = await Promise.all([
+      this._findTeamId(team1Name),
+      this._findTeamId(team2Name),
+    ]);
+
+    if (!team1Id || !team2Id) return this._mockH2H(team1Name, team2Name);
+
+    const resp = await axios.get(
+      `${this.apiBase}/teams/${team1Id}/matches?limit=50&status=FINISHED`,
+      { headers: this.footballHeaders, timeout: 8000 }
+    );
+
+    const h2hMatches = (resp.data.matches || [])
+      .filter((m) => m.homeTeam.id === team2Id || m.awayTeam.id === team2Id)
+      .slice(0, this.config.h2hMatchLimit);
+
+    if (h2hMatches.length < this.config.minDataThreshold) {
+      return { ...this._mockH2H(team1Name, team2Name), note: "Insufficient real H2H data" };
+    }
+
+    let t1Wins = 0, t2Wins = 0, draws = 0;
+    let t1Goals = 0, t2Goals = 0;
+    let weightedDom = 0;
+    const recent = [];
+    const total = h2hMatches.length;
+
+    h2hMatches.forEach((m, i) => {
+      const isT1Home = m.homeTeam.id === team1Id;
+      const t1Score = isT1Home ? m.score.fullTime.home : m.score.fullTime.away;
+      const t2Score = isT1Home ? m.score.fullTime.away : m.score.fullTime.home;
+      const recencyW = total - i; // newest = highest weight
+
+      t1Goals += t1Score;
+      t2Goals += t2Score;
+
+      if (t1Score > t2Score) { t1Wins++; weightedDom += recencyW; }
+      else if (t1Score < t2Score) { t2Wins++; weightedDom -= recencyW; }
+      else { draws++; }
+
+      if (i < 5) {
+        recent.push({
+          date: m.utcDate.split("T")[0],
+          home: m.homeTeam.name,
+          away: m.awayTeam.name,
+          score: `${m.score.fullTime.home}-${m.score.fullTime.away}`,
+          winner:
+            m.score.fullTime.home > m.score.fullTime.away ? m.homeTeam.name :
+            m.score.fullTime.home < m.score.fullTime.away ? m.awayTeam.name : "Draw",
+        });
+      }
+    });
+
+    const maxWeight = (total * (total + 1)) / 2;
+    const dominanceScore = 50 + (weightedDom / maxWeight) * 50;
+
+    const result = {
+      teams: { team1: team1Name, team2: team2Name },
+      totalMatches: total,
+      record: { team1Wins: t1Wins, team2Wins: t2Wins, draws },
+      rates: {
+        team1WinRate: +((t1Wins / total) * 100).toFixed(1),
+        team2WinRate: +((t2Wins / total) * 100).toFixed(1),
+        drawRate: +((draws / total) * 100).toFixed(1),
+      },
+      goals: {
+        team1Total: t1Goals,
+        team2Total: t2Goals,
+        avgPerMatch: +((t1Goals + t2Goals) / total).toFixed(2),
+      },
+      dominanceScore: +dominanceScore.toFixed(1), // >50 favors team1
+      advantage: t1Wins > t2Wins ? team1Name : t2Wins > t1Wins ? team2Name : "Balanced",
+      recentMeetings: recent,
+      reliability: total >= 5 ? "high" : "medium",
+      isMock: false,
+    };
+
+    this._setCache(cacheKey, result);
+    return result;
+  }
+
+  async _getLeagueStandings(competitionCode) {
+    const cacheKey = `standings:${competitionCode}`;
+    const cached = this._getCache(cacheKey);
+    if (cached) return cached;
+
+    const resp = await axios.get(
+      `${this.apiBase}/competitions/${competitionCode}/standings`,
+      { headers: this.footballHeaders, timeout: 8000 }
+    );
+
+    const table = resp.data.standings?.[0]?.table || [];
+
+    const result = {
+      competition: resp.data.competition?.name || competitionCode,
+      season: resp.data.season?.startDate?.split("-")[0],
+      standings: table.slice(0, 20).map((row) => ({
+        position: row.position,
+        team: row.team.name,
+        played: row.playedGames,
+        won: row.won,
+        drawn: row.draw,
+        lost: row.lost,
+        gf: row.goalsFor,
+        ga: row.goalsAgainst,
+        gd: row.goalDifference,
+        points: row.points,
+        form: row.form,
+      })),
+    };
+
+    this._setCache(cacheKey, result);
+    return result;
+  }
+
+  async _searchTeamNews(query) {
+    if (!this.newsApiKey) {
+      return {
+        query,
+        articles: [],
+        note: "Set NEWS_API_KEY env var for live injury/news data (free at newsapi.org)",
       };
-      
-      const team = teams.find(matchTeam);
-      
+    }
+
+    try {
+      const resp = await axios.get(
+        `https://newsapi.org/v2/everything` +
+          `?q=${encodeURIComponent(query)}` +
+          `&sortBy=publishedAt&pageSize=5&language=en` +
+          `&apiKey=${this.newsApiKey}`,
+        { timeout: 6000 }
+      );
+
+      const articles = (resp.data.articles || []).map((a) => ({
+        title: a.title,
+        source: a.source?.name,
+        publishedAt: a.publishedAt?.split("T")[0],
+        summary: a.description,
+      }));
+
+      return { query, articles, count: articles.length };
+    } catch (err) {
+      return { query, articles: [], error: err.message };
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  TEAM ID RESOLUTION
+  // ════════════════════════════════════════════════════════════════════
+
+  async _findTeamId(teamName) {
+    if (!teamName || typeof teamName !== "string") return null;
+    teamName = teamName.trim();
+
+    if (this.teamCache.has(teamName)) return this.teamCache.get(teamName);
+
+    // Strategy 1: name search endpoint
+    try {
+      const resp = await axios.get(
+        `${this.apiBase}/teams?name=${encodeURIComponent(teamName)}`,
+        { headers: this.footballHeaders, timeout: 5000 }
+      );
+      if (resp.data.teams?.length > 0) {
+        const id = resp.data.teams[0].id;
+        this.teamCache.set(teamName, id);
+        return id;
+      }
+    } catch { /* fall through */ }
+
+    // Strategy 2: full list fuzzy match
+    try {
+      const resp = await axios.get(
+        `${this.apiBase}/teams?limit=200`,
+        { headers: this.footballHeaders, timeout: 8000 }
+      );
+      const lower = teamName.toLowerCase();
+      const team = (resp.data.teams || []).find(
+        (t) =>
+          t.name?.toLowerCase() === lower ||
+          t.shortName?.toLowerCase() === lower ||
+          t.tla?.toLowerCase() === lower ||
+          t.name?.toLowerCase().includes(lower) ||
+          t.shortName?.toLowerCase().includes(lower)
+      );
       if (team) {
         this.teamCache.set(teamName, team.id);
         return team.id;
       }
-      
-      console.warn(`⚠️ Team not found: ${teamName}`);
-      return null;
-      
-    } catch (error) {
-      console.error(`Error finding team ${teamName}:`, error.message);
-      return null;
-    }
+    } catch { /* fall through */ }
+
+    return null;
   }
 
-  // ─── Fetch Head-to-Head History ──────────────────────────────────────
-  async getHeadToHead(team1, team2) {
-    try {
-      team1 = this.validateTeamName(team1);
-      team2 = this.validateTeamName(team2);
-      
-      console.log(`📊 Analyzing head-to-head: ${team1} vs ${team2}`);
-      
-      const team1Id = await this.findTeamId(team1);
-      const team2Id = await this.findTeamId(team2);
-      
-      if (!team1Id || !team2Id) {
-        return { 
-          ...this.generateMockHeadToHead(team1, team2), 
-          isMockData: true,
-          reliability: 'low'
-        };
-      }
-      
-      const response = await axios.get(
-        `${this.apiBase}/teams/${team1Id}/matches?limit=50&status=FINISHED`,
-        { headers: this.headers, timeout: 8000 }
-      );
-      
-      const h2hMatches = response.data.matches
-        .filter(m => (m.homeTeam.id === team2Id || m.awayTeam.id === team2Id))
-        .slice(0, this.config.h2hMatchLimit);
-      
-      if (h2hMatches.length < this.config.minDataThreshold) {
-        return { 
-          ...this.generateMockHeadToHead(team1, team2), 
-          isMockData: true,
-          reliability: 'low',
-          message: 'Limited historical data'
-        };
-      }
-      
-      let team1Wins = 0, team2Wins = 0, draws = 0;
-      let team1Goals = 0, team2Goals = 0;
-      let team1HomeWins = 0, team1AwayWins = 0;
-      let recentForm = [];
-      
-      h2hMatches.forEach((match, index) => {
-        const isTeam1Home = match.homeTeam.id === team1Id;
-        const team1Score = isTeam1Home ? match.score.fullTime.home : match.score.fullTime.away;
-        const team2Score = isTeam1Home ? match.score.fullTime.away : match.score.fullTime.home;
-        
-        team1Goals += team1Score;
-        team2Goals += team2Score;
-        
-        if (team1Score > team2Score) {
-          team1Wins++;
-          if (isTeam1Home) team1HomeWins++;
-          else team1AwayWins++;
-        } else if (team1Score < team2Score) {
-          team2Wins++;
-        } else {
-          draws++;
-        }
-        
-        // Track recent form (last 3 matches weighted more)
-        if (index < 3) {
-          recentForm.push({
-            result: team1Score > team2Score ? 'W' : team1Score < team2Score ? 'L' : 'D',
-            score: `${team1Score}-${team2Score}`,
-            date: new Date(match.utcDate).toLocaleDateString()
-          });
-        }
-      });
-      
-      // Calculate expected goals and dominance
-      const avgGoalsPerMatch = (team1Goals + team2Goals) / h2hMatches.length;
-      const team1WinRate = (team1Wins / h2hMatches.length) * 100;
-      const team2WinRate = (team2Wins / h2hMatches.length) * 100;
-      const drawRate = (draws / h2hMatches.length) * 100;
-      
-      // Calculate weighted dominance (more recent matches count more)
-      let weightedDominance = 0;
-      h2hMatches.forEach((match, idx) => {
-        const weight = 1 + (idx < 3 ? 0.5 : 0); // 50% extra weight for last 3 matches
-        const isTeam1Home = match.homeTeam.id === team1Id;
-        const team1Score = isTeam1Home ? match.score.fullTime.home : match.score.fullTime.away;
-        const team2Score = isTeam1Home ? match.score.fullTime.away : match.score.fullTime.home;
-        
-        if (team1Score > team2Score) weightedDominance += weight;
-        else if (team1Score < team2Score) weightedDominance -= weight;
-      });
-      
-      const dominanceScore = ((weightedDominance / h2hMatches.length) + 1) * 50;
-      
-      return {
-        totalMatches: h2hMatches.length,
-        team1Wins,
-        team2Wins,
-        draws,
-        team1Goals,
-        team2Goals,
-        team1WinRate: Number(team1WinRate.toFixed(1)),
-        team2WinRate: Number(team2WinRate.toFixed(1)),
-        drawRate: Number(drawRate.toFixed(1)),
-        avgGoalsPerMatch: Number(avgGoalsPerMatch.toFixed(2)),
-        homeAdvantage: {
-          team1HomeWins,
-          team1AwayWins,
-          homeWinRatio: team1Wins > 0 ? ((team1HomeWins / team1Wins) * 100).toFixed(1) : 0
-        },
-        recentForm,
-        advantage: team1Wins > team2Wins ? team1 : team2Wins > team1Wins ? team2 : 'Balanced',
-        dominance: Number(dominanceScore.toFixed(1)),
-        reliability: h2hMatches.length > 5 ? 'high' : 'medium',
-        isMockData: false
-      };
-      
-    } catch (error) {
-      console.error("Error fetching head-to-head:", error.message);
-      return { 
-        ...this.generateMockHeadToHead(team1, team2), 
-        isMockData: true,
-        error: error.message,
-        reliability: 'low'
-      };
-    }
-  }
+  // ════════════════════════════════════════════════════════════════════
+  //  OUTPUT PARSING
+  // ════════════════════════════════════════════════════════════════════
 
-  // ─── Fetch Team Form with Advanced Metrics ───────────────────────────
-  async getTeamForm(teamName, matches = this.config.formMatchLimit) {
-    try {
-      teamName = this.validateTeamName(teamName);
-      
-      console.log(`📈 Analyzing form for: ${teamName}`);
-      
-      const teamId = await this.findTeamId(teamName);
-      if (!teamId) {
-        return { ...this.generateMockForm(teamName), isMockData: true };
-      }
-      
-      const response = await axios.get(
-        `${this.apiBase}/teams/${teamId}/matches?limit=20&status=FINISHED`,
-        { headers: this.headers, timeout: 8000 }
-      );
-      
-      const allMatches = response.data.matches || [];
-      if (allMatches.length === 0) {
-        return { ...this.generateMockForm(teamName), isMockData: true };
-      }
-      
-      // Get recent matches with proper ordering (newest first)
-      const recentMatches = allMatches.slice(0, matches);
-      
-      let form = [];
-      let points = 0;
-      let goalsFor = 0, goalsAgainst = 0;
-      let cleanSheets = 0;
-      let comeFromBehind = 0;
-      let firstToScore = 0;
-      
-      recentMatches.forEach((match, index) => {
-        const isHome = match.homeTeam.id === teamId;
-        const teamScore = isHome ? match.score.fullTime.home : match.score.fullTime.away;
-        const opponentScore = isHome ? match.score.fullTime.away : match.score.fullTime.home;
-        
-        goalsFor += teamScore;
-        goalsAgainst += opponentScore;
-        
-        if (opponentScore === 0) cleanSheets++;
-        
-        // Check if they scored first (simplified - assumes home team kicks off)
-        if (index === 0) { // Just for first match as example
-          // This would need actual timeline data from API
-        }
-        
-        let result;
-        if (teamScore > opponentScore) {
-          result = 'W';
-          points += 3;
-        } else if (teamScore < opponentScore) {
-          result = 'L';
-        } else {
-          result = 'D';
-          points += 1;
-        }
-        
-        form.push({
-          opponent: isHome ? match.awayTeam.name : match.homeTeam.name,
-          result,
-          score: `${teamScore}-${opponentScore}`,
-          date: new Date(match.utcDate).toLocaleDateString(),
-          isHome,
-          goalDiff: teamScore - opponentScore
-        });
-      });
-      
-      const formString = form.map(f => f.result).join('');
-      
-      // Calculate weighted form score (more recent matches count more)
-      let weightedScore = 0;
-      let totalWeight = 0;
-      form.forEach((f, idx) => {
-        const weight = 1 + (idx < 3 ? 0.3 : 0); // Recent 3 matches weighted more
-        totalWeight += weight;
-        if (f.result === 'W') weightedScore += 3 * weight;
-        else if (f.result === 'D') weightedScore += 1 * weight;
-      });
-      
-      const formScore = (weightedScore / (totalWeight * 3)) * 100;
-      
-      // Calculate expected goals and defensive strength
-      const xGFor = goalsFor / matches;
-      const xGAgainst = goalsAgainst / matches;
-      const goalDiff = goalsFor - goalsAgainst;
-      
-      // Momentum calculation (last 3 matches trend)
-      const last3Results = form.slice(0, 3).map(f => f.result);
-      const momentum = 
-        last3Results.filter(r => r === 'W').length >= 2 ? 'positive' :
-        last3Results.filter(r => r === 'L').length >= 2 ? 'negative' : 'neutral';
-      
-      return {
-        team: teamName,
-        recentForm: form,
-        formString,
-        formScore: Number(formScore.toFixed(1)),
-        points,
-        goalsFor,
-        goalsAgainst,
-        goalDiff,
-        averageGoalsFor: Number(xGFor.toFixed(2)),
-        averageGoalsAgainst: Number(xGAgainst.toFixed(2)),
-        cleanSheets,
-        cleanSheetRate: Number(((cleanSheets / matches) * 100).toFixed(1)),
-        formRating: this.calculateFormRating(formString),
-        trend: this.analyzeTrend(formString),
-        momentum,
-        reliability: matches >= 5 ? 'high' : 'medium',
-        isMockData: false
-      };
-      
-    } catch (error) {
-      console.error("Error fetching team form:", error.message);
-      return { ...this.generateMockForm(teamName), isMockData: true };
-    }
-  }
+  _parseGeminiOutput(text, homeTeam, awayTeam) {
+    // Extract JSON block between ```json ... ``` or raw { ... }
+    const jsonMatch =
+      text.match(/```json\s*([\s\S]+?)\s*```/) ||
+      text.match(/(\{[\s\S]+\})/);
 
-  // ─── AI Prediction Model with Proper Probability Distribution ────────
-  async predictOutcome(homeTeam, awayTeam) {
-    try {
-      homeTeam = this.validateTeamName(homeTeam);
-      awayTeam = this.validateTeamName(awayTeam);
-      
-      console.log(`🤖 AI predicting: ${homeTeam} vs ${awayTeam}`);
-      
-      const [h2h, homeForm, awayForm] = await Promise.all([
-        this.getHeadToHead(homeTeam, awayTeam),
-        this.getTeamForm(homeTeam),
-        this.getTeamForm(awayTeam)
-      ]);
-      
-      // Calculate raw scores
-      const homeFormScore = homeForm.formScore || 50;
-      const awayFormScore = awayForm.formScore || 50;
-      
-      // Apply home advantage
-      const adjustedHomeForm = homeFormScore * this.config.homeAdvantage;
-      
-      // Calculate H2H score
-      let h2hScore = 50;
-      if (h2h.totalMatches > 0 && !h2h.isMockData) {
-        h2hScore = (h2h.team1Wins * 3 + h2h.draws) / (h2h.totalMatches * 3) * 100;
-      }
-      
-      // Weighted combination
-      const rawHome = (
-        adjustedHomeForm * this.config.weights.form +
-        h2hScore * this.config.weights.h2h +
-        (100 - awayFormScore) * this.config.weights.recent
-      ) / (this.config.weights.form + this.config.weights.h2h + this.config.weights.recent);
-      
-      const rawAway = (
-        awayFormScore * this.config.weights.form +
-        (100 - h2hScore) * this.config.weights.h2h +
-        (100 - homeFormScore) * this.config.weights.recent
-      ) / (this.config.weights.form + this.config.weights.h2h + this.config.weights.recent);
-      
-      // Base draw probability - influenced by team strengths
-      const strengthDiff = Math.abs(homeFormScore - awayFormScore);
-      const adjustedDrawProb = this.config.baseDrawProb + (strengthDiff * 0.2);
-      
-      // Normalize probabilities to sum to 100
-      const total = rawHome + rawAway + adjustedDrawProb;
-      const homeWinProb = (rawHome / total) * 100;
-      const awayWinProb = (rawAway / total) * 100;
-      const drawProb = (adjustedDrawProb / total) * 100;
-      
-      // Generate insights
-      const insights = this.generateInsights(homeTeam, awayTeam, {
-        h2h, homeForm, awayForm, homeWinProb, awayWinProb, drawProb
-      });
-      
-      // Calculate confidence based on data quality
-      const dataQuality = [
-        !h2h.isMockData ? 1 : 0,
-        !homeForm.isMockData ? 1 : 0,
-        !awayForm.isMockData ? 1 : 0
-      ].reduce((a, b) => a + b, 0) / 3;
-      
-      const confidence = this.calculateConfidence(
-        homeWinProb, awayWinProb, drawProb, dataQuality
-      );
-      
-      return {
-        prediction: {
-          homeWin: Number(homeWinProb.toFixed(1)),
-          draw: Number(drawProb.toFixed(1)),
-          awayWin: Number(awayWinProb.toFixed(1))
-        },
-        mostLikely: homeWinProb > awayWinProb && homeWinProb > drawProb ? 'HOME_WIN' : 
-                    awayWinProb > homeWinProb && awayWinProb > drawProb ? 'AWAY_WIN' : 'DRAW',
-        confidence,
-        insights,
-        statistics: {
-          headToHead: {
-            totalMatches: h2h.totalMatches || 0,
-            team1Wins: h2h.team1Wins || 0,
-            team2Wins: h2h.team2Wins || 0,
-            draws: h2h.draws || 0,
-            dominance: h2h.dominance || 50,
-            reliability: h2h.reliability || 'low'
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[1]);
+        return {
+          ...parsed,
+          _meta: {
+            homeTeam,
+            awayTeam,
+            generatedAt: new Date().toISOString(),
+            model: this.model,
           },
-          homeTeamForm: {
-            formString: homeForm.formString || '-----',
-            formRating: homeForm.formRating || 'Unknown',
-            averageGoalsFor: homeForm.averageGoalsFor || 0,
-            averageGoalsAgainst: homeForm.averageGoalsAgainst || 0,
-            momentum: homeForm.momentum || 'neutral'
-          },
-          awayTeamForm: {
-            formString: awayForm.formString || '-----',
-            formRating: awayForm.formRating || 'Unknown',
-            averageGoalsFor: awayForm.averageGoalsFor || 0,
-            averageGoalsAgainst: awayForm.averageGoalsAgainst || 0,
-            momentum: awayForm.momentum || 'neutral'
-          }
-        },
-        keyFactors: this.identifyKeyFactors(h2h, homeForm, awayForm),
-        dataQuality: dataQuality > 0.66 ? 'high' : dataQuality > 0.33 ? 'medium' : 'low'
-      };
-      
-    } catch (error) {
-      console.error("Prediction error:", error);
-      return {
-        prediction: { homeWin: 33.3, draw: 33.3, awayWin: 33.3 },
-        mostLikely: 'UNKNOWN',
-        confidence: 'Low',
-        insights: ['Unable to generate prediction due to data error'],
-        statistics: {},
-        keyFactors: ['Technical error in analysis'],
-        dataQuality: 'low'
-      };
+        };
+      } catch { /* fall through */ }
     }
-  }
 
-  // ─── Helper: Calculate Form Rating ──────────────────────────────────
-  calculateFormRating(formString) {
-    if (!formString) return 'Unknown';
-    const wins = (formString.match(/W/g) || []).length;
-    const losses = (formString.match(/L/g) || []).length;
-    
-    if (wins >= 5) return 'Excellent';
-    if (wins >= 4) return 'Very Good';
-    if (wins >= 3) return 'Good';
-    if (wins >= 2) return 'Average';
-    if (wins >= 1 || losses < 3) return 'Below Average';
-    return 'Poor';
-  }
-
-  // ─── Helper: Analyze Trend ──────────────────────────────────────────
-  analyzeTrend(formString) {
-    if (!formString) return '↔️ Unknown';
-    const last3 = formString.slice(-3);
-    if (last3 === 'WWW') return '🚀 Excellent';
-    if (last3 === 'LLL') return '📉 Poor';
-    if (last3.match(/WW/g)) return '📈 Improving';
-    if (last3.match(/LL/g)) return '📊 Declining';
-    return '↔️ Stable';
-  }
-
-  // ─── Helper: Generate AI Insights ───────────────────────────────────
-  generateInsights(homeTeam, awayTeam, data) {
-    const insights = [];
-    
-    // Head-to-head insights
-    if (data.h2h.totalMatches >= 3) {
-      if (data.h2h.team1Wins > data.h2h.team2Wins * 2) {
-        insights.push(`⚔️ ${homeTeam} dominates historically (${data.h2h.team1Wins}-${data.h2h.team2Wins} in last ${data.h2h.totalMatches})`);
-      } else if (data.h2h.team2Wins > data.h2h.team1Wins * 2) {
-        insights.push(`⚔️ ${awayTeam} has historical advantage (${data.h2h.team2Wins}-${data.h2h.team1Wins})`);
-      } else if (data.h2h.draws > data.h2h.totalMatches / 2) {
-        insights.push(`⚔️ These teams often draw (${data.h2h.draws} draws)`);
-      }
-    }
-    
-    // Form insights
-    if (data.homeForm.formRating === 'Excellent' || data.homeForm.formRating === 'Very Good') {
-      insights.push(`🔥 ${homeTeam} in ${data.homeForm.formRating.toLowerCase()} form (${data.homeForm.formString})`);
-    }
-    if (data.awayForm.formRating === 'Excellent' || data.awayForm.formRating === 'Very Good') {
-      insights.push(`🔥 ${awayTeam} in ${data.awayForm.formRating.toLowerCase()} form (${data.awayForm.formString})`);
-    }
-    
-    // Goal scoring insights
-    if (data.homeForm.averageGoalsFor > 2) {
-      insights.push(`⚽ ${homeTeam} scores ${data.homeForm.averageGoalsFor} goals/game - strong attack`);
-    }
-    if (data.awayForm.averageGoalsAgainst > 2) {
-      insights.push(`🛡️ ${awayTeam} concedes ${data.awayForm.averageGoalsAgainst} goals/game - defensive weakness`);
-    }
-    
-    // Momentum insights
-    if (data.homeForm.momentum === 'positive' && data.awayForm.momentum === 'negative') {
-      insights.push(`📈 Momentum heavily favors ${homeTeam}`);
-    }
-    if (data.awayForm.momentum === 'positive' && data.homeForm.momentum === 'negative') {
-      insights.push(`📈 Momentum heavily favors ${awayTeam}`);
-    }
-    
-    // Goal difference insights
-    if (data.homeForm.goalDiff > 5 && data.awayForm.goalDiff < -3) {
-      insights.push(`📊 Massive goal difference advantage for ${homeTeam}`);
-    }
-    
-    return insights;
-  }
-
-  // ─── Helper: Identify Key Factors ───────────────────────────────────
-  identifyKeyFactors(h2h, homeForm, awayForm) {
-    const factors = [];
-    
-    if (homeForm.formRating === 'Excellent' && awayForm.formRating === 'Poor') {
-      factors.push('Major form disparity - home team heavy favorite');
-    } else if (homeForm.formRating === 'Excellent' && awayForm.formRating === 'Average') {
-      factors.push('Home team has clear form advantage');
-    }
-    
-    if (h2h.advantage && h2h.advantage !== 'Balanced' && !h2h.isMockData) {
-      factors.push(`${h2h.advantage} has historical edge in this fixture`);
-    }
-    
-    if (homeForm.averageGoalsFor > 2 && awayForm.averageGoalsAgainst > 1.8) {
-      factors.push('Expected goals - home team should score');
-    }
-    
-    if (homeForm.cleanSheetRate > 40 && awayForm.averageGoalsFor < 1) {
-      factors.push('Home defense likely to keep clean sheet');
-    }
-    
-    if (Math.abs(homeForm.formScore - awayForm.formScore) < 5) {
-      factors.push('Very evenly matched teams');
-    }
-    
-    return factors;
-  }
-
-  // ─── Helper: Calculate Confidence with Data Quality ─────────────────
-  calculateConfidence(home, away, draw, dataQuality = 1) {
-    const maxProb = Math.max(home, away, draw);
-    let baseConfidence = 'Low';
-    
-    if (maxProb > 70) baseConfidence = 'High';
-    else if (maxProb > 55) baseConfidence = 'Medium';
-    else baseConfidence = 'Low';
-    
-    // Adjust for data quality
-    if (dataQuality < 0.5 && baseConfidence === 'High') return 'Medium';
-    if (dataQuality < 0.3 && baseConfidence !== 'Low') return 'Low';
-    
-    return baseConfidence;
-  }
-
-  // ─── Mock Data Generators ───────────────────────────────────────────
-  generateMockHeadToHead(team1, team2) {
-    const totalMatches = Math.floor(Math.random() * 4) + 2;
-    const team1Wins = Math.floor(Math.random() * (totalMatches));
-    const team2Wins = Math.floor(Math.random() * (totalMatches - team1Wins));
-    const draws = totalMatches - team1Wins - team2Wins;
-    
+    // Could not parse JSON — return raw text for debugging
     return {
-      totalMatches,
-      team1Wins,
-      team2Wins,
-      draws,
-      team1Goals: team1Wins * 2 + draws,
-      team2Goals: team2Wins * 2 + draws,
-      team1WinRate: Number(((team1Wins / totalMatches) * 100).toFixed(1)),
-      team2WinRate: Number(((team2Wins / totalMatches) * 100).toFixed(1)),
-      drawRate: Number(((draws / totalMatches) * 100).toFixed(1)),
-      avgGoalsPerMatch: Number(((team1Wins * 2 + team2Wins * 2 + draws * 2) / totalMatches).toFixed(2)),
-      recentMatches: [],
-      advantage: team1Wins > team2Wins ? team1 : team2Wins > team1Wins ? team2 : 'Balanced',
-      dominance: Number(((team1Wins + draws/2) / totalMatches * 100).toFixed(1)),
-      reliability: 'low'
+      homeTeam,
+      awayTeam,
+      rawAnalysis: text,
+      prediction: { homeWin: null, draw: null, awayWin: null },
+      mostLikely: "UNKNOWN",
+      confidence: "LOW",
+      _parseError: true,
+      _meta: { generatedAt: new Date().toISOString(), model: this.model },
     };
   }
 
-  generateMockForm(teamName) {
+  // ════════════════════════════════════════════════════════════════════
+  //  PROMPTS
+  // ════════════════════════════════════════════════════════════════════
+
+  _systemPrompt() {
+    return `You are an elite football match analyst and sports betting specialist.
+Your job is to autonomously gather data using the provided tools and produce a
+rigorous, probability-calibrated match prediction.
+
+ANALYSIS PROTOCOL (follow this order):
+1. Call get_team_form for the HOME team.
+2. Call get_team_form for the AWAY team.
+3. Call get_head_to_head for the fixture.
+4. Call get_league_standings if positional context would help.
+5. Call search_team_news for both teams (injuries, suspensions, lineup news).
+6. Synthesise ALL gathered data into a final prediction JSON.
+
+BETTING SPECIALIST NOTES:
+- Identify value bets where your probability exceeds typical bookmaker implied odds.
+- Suggest Over/Under goal line based on attack strength and defensive record.
+- Estimate BTTS (Both Teams To Score) from clean sheet rates and avg goals.
+- Suggest Asian Handicap line when one team is a clear favourite.
+- Flag any bets to AVOID due to uncertainty or conflicting signals.
+
+OUTPUT FORMAT — return ONLY this JSON block, nothing else:
+
+\`\`\`json
+{
+  "homeTeam": "string",
+  "awayTeam": "string",
+  "competition": "string",
+  "prediction": {
+    "homeWin": 0.0,
+    "draw": 0.0,
+    "awayWin": 0.0
+  },
+  "mostLikely": "HOME_WIN | DRAW | AWAY_WIN",
+  "confidence": "HIGH | MEDIUM | LOW",
+  "expectedGoals": {
+    "home": 0.0,
+    "away": 0.0,
+    "total": 0.0
+  },
+  "bettingAngles": {
+    "recommendedBet": "string",
+    "valueBet": "string or null",
+    "btts": "YES | NO | UNCERTAIN",
+    "bttsConfidence": "HIGH | MEDIUM | LOW",
+    "overUnderLine": 2.5,
+    "overUnderCall": "OVER | UNDER | UNCERTAIN",
+    "asianHandicap": "string or null",
+    "avoidBets": ["list"]
+  },
+  "keyFactors": ["factor 1", "factor 2", "factor 3"],
+  "riskFactors": ["risk 1"],
+  "formSummary": {
+    "homeTeamForm": "string",
+    "awayTeamForm": "string",
+    "homeMomentum": "positive | neutral | negative",
+    "awayMomentum": "positive | neutral | negative"
+  },
+  "h2hSummary": "one sentence",
+  "injuryOrNewsAlert": "string or null",
+  "analystNote": "2-3 sentence deeper insight",
+  "dataQuality": "HIGH | MEDIUM | LOW",
+  "warningFlags": ["any data or external factor concerns"]
+}
+\`\`\`
+
+RULES:
+- prediction values must sum to exactly 100.
+- Be a sharp analyst. Do not be optimistic — calibrate probabilities carefully.
+- Do NOT output any text outside the JSON block.`;
+  }
+
+  _buildPrompt(homeTeam, awayTeam, competition) {
+    return (
+      `Analyse the upcoming match:\n\n` +
+      `HOME TEAM : ${homeTeam}\n` +
+      `AWAY TEAM : ${awayTeam}\n` +
+      `COMPETITION: ${competition}\n\n` +
+      `Follow your analysis protocol. Start with get_team_form for both teams.`
+    );
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  CACHE HELPERS
+  // ════════════════════════════════════════════════════════════════════
+
+  _getCache(key) {
+    const entry = this.resultCache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) { this.resultCache.delete(key); return null; }
+    return entry.data;
+  }
+
+  _setCache(key, data) {
+    this.resultCache.set(key, { data, expiresAt: Date.now() + this.CACHE_TTL_MS });
+  }
+
+  clearCaches() {
+    this.teamCache.clear();
+    this.resultCache.clear();
+    console.log("✓ Caches cleared");
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  //  MOCK FALLBACKS  (when API unavailable)
+  // ════════════════════════════════════════════════════════════════════
+
+  _mockForm(teamName, n) {
+    const results = ["W", "W", "D", "L", "W", "D"];
+    let formString = "";
     const form = [];
-    const results = ['W', 'D', 'L'];
-    let formString = '';
-    
-    for (let i = 0; i < 5; i++) {
-      const result = results[Math.floor(Math.random() * 3)];
-      formString += result;
-      const homeScore = Math.floor(Math.random() * 3);
-      const awayScore = Math.floor(Math.random() * 3);
-      form.push({
-        opponent: 'Opponent FC',
-        result,
-        score: `${homeScore}-${awayScore}`,
-        date: new Date(Date.now() - i * 86400000).toLocaleDateString(),
-        isHome: Math.random() > 0.5,
-        goalDiff: homeScore - awayScore
-      });
+    for (let i = 0; i < n; i++) {
+      const r = results[i % results.length];
+      formString += r;
+      form.push({ matchday: i + 1, opponent: "Unknown FC", venue: "H", result: r, score: "1-1", date: "N/A", goalDiff: 0 });
     }
-    
     const wins = (formString.match(/W/g) || []).length;
     const draws = (formString.match(/D/g) || []).length;
-    const goalsFor = Math.floor(Math.random() * 8) + 3;
-    const goalsAgainst = Math.floor(Math.random() * 6) + 2;
-    
     return {
       team: teamName,
-      recentForm: form,
       formString,
-      formScore: (wins * 3 + draws) / 15 * 100,
-      points: wins * 3 + draws,
-      goalsFor,
-      goalsAgainst,
-      goalDiff: goalsFor - goalsAgainst,
-      averageGoalsFor: Number((goalsFor / 5).toFixed(2)),
-      averageGoalsAgainst: Number((goalsAgainst / 5).toFixed(2)),
-      cleanSheets: Math.floor(Math.random() * 2),
-      cleanSheetRate: Number((Math.random() * 40).toFixed(1)),
-      formRating: wins >= 3 ? 'Good' : wins >= 2 ? 'Average' : 'Below Average',
-      trend: '↔️ Stable',
-      momentum: wins >= 3 ? 'positive' : wins <= 1 ? 'negative' : 'neutral',
-      reliability: 'low'
+      formScore: +((wins * 3 + draws) / (n * 3) * 100).toFixed(1),
+      record: { wins, draws, losses: n - wins - draws, points: wins * 3 + draws },
+      goals: { avgScored: 1.4, avgConceded: 1.1, cleanSheetRate: 20 },
+      momentum: "neutral",
+      recentMatches: form,
+      isMock: true,
     };
+  }
+
+  _mockH2H(team1, team2) {
+    return {
+      teams: { team1, team2 },
+      totalMatches: 5,
+      record: { team1Wins: 2, team2Wins: 2, draws: 1 },
+      rates: { team1WinRate: 40, team2WinRate: 40, drawRate: 20 },
+      goals: { avgPerMatch: 2.4 },
+      dominanceScore: 50,
+      advantage: "Balanced",
+      recentMeetings: [],
+      reliability: "low",
+      isMock: true,
+    };
+  }
+
+  _fallbackResult(homeTeam, awayTeam) {
+    return {
+      homeTeam,
+      awayTeam,
+      prediction: { homeWin: 40, draw: 25, awayWin: 35 },
+      mostLikely: "HOME_WIN",
+      confidence: "LOW",
+      bettingAngles: { recommendedBet: "No bet — data unavailable", btts: "UNCERTAIN" },
+      keyFactors: ["Agent failed to complete analysis"],
+      dataQuality: "LOW",
+      _meta: { generatedAt: new Date().toISOString(), model: this.model, fallback: true },
+    };
+  }
+
+  _log(msg) {
+    console.log(msg);
   }
 }
 
-module.exports = AIAnalysisAgent;
+// ══════════════════════════════════════════════════════════════════════
+//  USAGE
+// ══════════════════════════════════════════════════════════════════════
+
+async function main() {
+  const agent = new AIMatchAgent({
+    geminiApiKey:    process.env.GEMINI_API_KEY,
+    footballApiKey:  process.env.FOOTBALL_API_KEY,
+    newsApiKey:      process.env.NEWS_API_KEY || null,   // optional
+  });
+
+  const result = await agent.predict("Manchester City", "Arsenal", {
+    competition: "Premier League",
+    verbose: false,
+  });
+
+  console.log("\n\n══════ PREDICTION RESULT ══════");
+  console.log(JSON.stringify(result, null, 2));
+}
+
+main().catch(console.error);
+
+module.exports = AIMatchAgent;
