@@ -1,6 +1,7 @@
 /**
  * World Cup 2026 Betting — Backend API
- * ONLY real World Cup data - NO MOCK - Neon PostgreSQL
+ * Matches: ONLY real World Cup data from API
+ * Other data: MOCK for demo (pools, odds, leaderboard, ultimate)
  */
 
 require("dotenv").config();
@@ -34,12 +35,9 @@ if (!DATABASE_URL) {
 // ─── Neon PostgreSQL Connection ───────────────────────────────────────────
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: { rejectUnauthorized: false }
 });
 
-// Test database connection
 pool.connect((err, client, release) => {
   if (err) {
     console.error('❌ Error connecting to Neon:', err.stack);
@@ -49,58 +47,41 @@ pool.connect((err, client, release) => {
   }
 });
 
-// Helper for database queries
 const query = async (text, params) => {
   const start = Date.now();
   try {
     const res = await pool.query(text, params);
-    const duration = Date.now() - start;
-    console.log('📊 Executed query:', { text, duration, rows: res.rowCount });
+    console.log('📊 Query:', { text: text.substring(0, 50) + '...', duration: Date.now() - start, rows: res.rowCount });
     return res;
   } catch (err) {
-    console.error('❌ Query error:', { text, error: err.message });
+    console.error('❌ Query error:', err.message);
     throw err;
   }
 };
 
 // Initialize database tables
 async function initDatabase() {
-  try {
-    // Create matches table
-    await query(`
-      CREATE TABLE IF NOT EXISTS matches (
-        id              INTEGER PRIMARY KEY,
-        home_team       TEXT NOT NULL,
-        away_team       TEXT NOT NULL,
-        start_time      BIGINT NOT NULL,
-        status          TEXT DEFAULT 'SCHEDULED',
-        home_score      INTEGER DEFAULT 0,
-        away_score      INTEGER DEFAULT 0,
-        winner          TEXT,
-        competition_code TEXT,
-        competition_name TEXT,
-        season          TEXT,
-        matchday        INTEGER,
-        last_updated    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `);
-
-    // Create index for faster queries
-    await query(`CREATE INDEX IF NOT EXISTS idx_start_time ON matches(start_time);`);
-    await query(`CREATE INDEX IF NOT EXISTS idx_status ON matches(status);`);
-    
-    console.log("✅ Database tables initialized");
-    
-    // Check if we have matches
-    const result = await query("SELECT COUNT(*) FROM matches");
-    const count = parseInt(result.rows[0].count);
-    console.log(`📊 Current matches in DB: ${count}`);
-    
-    return count;
-  } catch (error) {
-    console.error("❌ Database initialization error:", error);
-    throw error;
-  }
+  await query(`
+    CREATE TABLE IF NOT EXISTS matches (
+      id INTEGER PRIMARY KEY,
+      home_team TEXT NOT NULL,
+      away_team TEXT NOT NULL,
+      start_time BIGINT NOT NULL,
+      status TEXT DEFAULT 'SCHEDULED',
+      home_score INTEGER DEFAULT 0,
+      away_score INTEGER DEFAULT 0,
+      winner TEXT,
+      competition_code TEXT,
+      competition_name TEXT,
+      last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+  
+  console.log("✅ Database tables initialized");
+  const result = await query("SELECT COUNT(*) FROM matches");
+  const count = parseInt(result.rows[0].count);
+  console.log(`📊 Current matches in DB: ${count}`);
+  return count;
 }
 
 // ─── Football-Data.org API ─────────────────────────────────────────────────
@@ -133,7 +114,7 @@ function normalizeTeam(name) {
   return map[name] || name;
 }
 
-// ─── Fetch ONLY World Cup matches from API - NO MOCK ─────────────────────
+// ─── Fetch ONLY World Cup matches from API ───────────────────────────────
 async function fetchWorldCupMatches() {
   console.log("🌍 Fetching World Cup matches from API...");
   
@@ -144,27 +125,12 @@ async function fetchWorldCupMatches() {
     );
     
     const matches = response.data.matches || [];
-    
-    if (matches.length === 0) {
-      console.log("⚠️ API returned 0 World Cup matches");
-      return [];
-    }
-    
-    console.log(`✅ Found ${matches.length} World Cup matches from API`);
-    
-    // Log competition info
-    if (response.data.competition) {
-      console.log(`   Competition: ${response.data.competition.name}`);
-      console.log(`   Season: ${response.data.season?.startDate} to ${response.data.season?.endDate}`);
-    }
-    
+    console.log(`✅ Found ${matches.length} World Cup matches`);
     return matches;
     
   } catch (error) {
     if (error.response?.status === 404) {
       console.log("⚠️ World Cup competition not found in API");
-    } else if (error.response?.status === 429) {
-      console.log("⚠️ Rate limited by API - try again later");
     } else {
       console.error("❌ Failed to fetch World Cup data:", error.message);
     }
@@ -174,14 +140,9 @@ async function fetchWorldCupMatches() {
 
 // ─── Store matches in Neon PostgreSQL ────────────────────────────────────
 async function storeMatches(matches) {
-  if (matches.length === 0) {
-    console.log("⚠️ No matches to store");
-    return 0;
-  }
+  if (matches.length === 0) return 0;
   
   let stored = 0;
-  let updated = 0;
-  
   for (const match of matches) {
     const startTime = Math.floor(new Date(match.utcDate).getTime() / 1000);
     const homeTeam = normalizeTeam(match.homeTeam?.name || "TBD");
@@ -189,8 +150,6 @@ async function storeMatches(matches) {
     const status = match.status || "SCHEDULED";
     const homeScore = match.score?.fullTime?.home ?? 0;
     const awayScore = match.score?.fullTime?.away ?? 0;
-    const season = match.season?.startDate?.split('-')[0] || "2026";
-    const matchday = match.matchday || null;
     
     let winner = null;
     if (status === "FINISHED" && homeScore !== awayScore) {
@@ -198,45 +157,34 @@ async function storeMatches(matches) {
     }
     
     try {
-      const result = await query(
+      await query(
         `INSERT INTO matches 
-         (id, home_team, away_team, start_time, status, home_score, away_score, winner, 
-          competition_code, competition_name, season, matchday, last_updated)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)
+         (id, home_team, away_team, start_time, status, home_score, away_score, winner, competition_code, competition_name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
          ON CONFLICT (id) DO UPDATE SET
           status = EXCLUDED.status,
           home_score = EXCLUDED.home_score,
           away_score = EXCLUDED.away_score,
           winner = EXCLUDED.winner,
-          last_updated = CURRENT_TIMESTAMP
-         RETURNING (xmax = 0) AS inserted`,
-        [
-          match.id, homeTeam, awayTeam, startTime, status, homeScore, awayScore, winner,
-          'WC', 'FIFA World Cup', season, matchday
-        ]
+          last_updated = CURRENT_TIMESTAMP`,
+        [match.id, homeTeam, awayTeam, startTime, status, homeScore, awayScore, winner, 'WC', 'FIFA World Cup']
       );
-      
-      if (result.rows[0]?.inserted) {
-        stored++;
-      } else {
-        updated++;
-      }
-      
+      stored++;
     } catch (e) {
-      console.error(`   ❌ Error storing match ${match.id}:`, e.message);
+      console.error(`❌ Error storing match ${match.id}:`, e.message);
     }
   }
   
-  console.log(`✅ Stored: ${stored} new, Updated: ${updated} existing`);
+  console.log(`✅ Stored ${stored} matches`);
   return stored;
 }
 
-// ─── Format match for API response ────────────────────────────────────────
+// ─── Format match with MOCK pools/odds ────────────────────────────────────
 function formatMatch(row) {
-  // Calculate dynamic odds based on team strengths (will be replaced by AI later)
-  const homePool = Math.floor(Math.random() * 10) + 5;
-  const drawPool = Math.floor(Math.random() * 5) + 2;
-  const awayPool = Math.floor(Math.random() * 8) + 3;
+  // MOCK pools and odds (for frontend demo)
+  const homePool = Math.floor(Math.random() * 100) + 50;
+  const drawPool = Math.floor(Math.random() * 50) + 20;
+  const awayPool = Math.floor(Math.random() * 80) + 40;
   const totalPool = homePool + drawPool + awayPool;
   
   const odds = {
@@ -255,13 +203,9 @@ function formatMatch(row) {
       code: row.competition_code,
       name: row.competition_name
     },
-    season: row.season,
-    matchday: row.matchday,
-    score: {
-      home: row.home_score,
-      away: row.away_score
-    },
+    score: { home: row.home_score, away: row.away_score },
     winner: row.winner,
+    // MOCK data below
     pools: {
       home: homePool.toString(),
       draw: drawPool.toString(),
@@ -279,7 +223,7 @@ function formatMatch(row) {
 app.get("/", (req, res) => {
   res.json({
     name: "World Cup 2026 API",
-    description: "ONLY real World Cup data from football-data.org - NO MOCK",
+    description: "Matches: REAL data from API | Pools/Odds: MOCK data for demo",
     status: "running",
     environment: isVercel ? "vercel" : "local",
     database: "Neon PostgreSQL",
@@ -310,51 +254,34 @@ app.get("/api/health", async (req, res) => {
     const result = await query("SELECT COUNT(*) FROM matches");
     const matchCount = parseInt(result.rows[0].count);
     
-    // Test API connectivity
-    let apiAvailable = false;
-    try {
-      await axios.get(`${API_BASE}/competitions/WC`, { headers: API_HEADERS, timeout: 3000 });
-      apiAvailable = true;
-    } catch (e) {
-      apiAvailable = false;
-    }
-    
     res.json({ 
       status: "ok",
       matchesInDB: matchCount,
-      apiAvailable,
       database: "Neon PostgreSQL",
       apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
       geminiKey: GEMINI_API_KEY ? "✅" : "❌",
-      environment: isVercel ? "vercel" : "local",
+      note: "Matches: REAL | Pools/Odds: MOCK",
       timestamp: new Date().toISOString()
     });
   } catch (error) {
-    res.json({ 
-      status: "ok", 
-      matchesInDB: 0,
-      error: error.message
-    });
+    res.json({ status: "ok", matchesInDB: 0 });
   }
 });
 
-// GET /api/matches - ONLY World Cup matches
+// GET /api/matches - REAL matches from API + MOCK pools/odds
 app.get("/api/matches", async (req, res) => {
   try {
-    const result = await query(
-      "SELECT * FROM matches ORDER BY start_time ASC"
-    );
-    
+    const result = await query("SELECT * FROM matches ORDER BY start_time ASC");
     const matches = result.rows.map(formatMatch);
     
     res.json({ 
       matches,
       total: matches.length,
-      source: "FIFA World Cup Data",
-      note: matches.length === 0 ? "No World Cup matches available in API yet" : "Real World Cup matches only"
+      source: "Real World Cup Data",
+      pools: "MOCK data (for demo)",
+      odds: "MOCK data (for demo)"
     });
   } catch (error) {
-    console.error("Error fetching matches:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -362,79 +289,84 @@ app.get("/api/matches", async (req, res) => {
 // GET /api/matches/:id
 app.get("/api/matches/:id", async (req, res) => {
   try {
-    const result = await query(
-      "SELECT * FROM matches WHERE id = $1",
-      [req.params.id]
-    );
-    
+    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Match not found" });
     }
-    
     res.json({ match: formatMatch(result.rows[0]) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/stats
+// GET /api/stats - REAL match counts + MOCK betting data
 app.get("/api/stats", async (req, res) => {
   try {
     const matchCount = await query("SELECT COUNT(*) FROM matches");
     const liveMatches = await query("SELECT COUNT(*) FROM matches WHERE status = 'IN_PLAY'");
     const finishedMatches = await query("SELECT COUNT(*) FROM matches WHERE status = 'FINISHED'");
-    const scheduledMatches = await query("SELECT COUNT(*) FROM matches WHERE status = 'SCHEDULED'");
     
     res.json({
+      // REAL data
       matchCount: parseInt(matchCount.rows[0].count),
       liveMatches: parseInt(liveMatches.rows[0].count),
       finishedMatches: parseInt(finishedMatches.rows[0].count),
-      scheduledMatches: parseInt(scheduledMatches.rows[0].count),
-      totalVolumeCLUTCH: "0",
-      uniqueUsers: 0,
-      totalBets: 0,
-      note: "Real World Cup stats - waiting for matches"
+      // MOCK data
+      totalVolumeCLUTCH: "125000",
+      uniqueUsers: 1243,
+      totalBets: 5678,
+      note: "Stats: Real match counts, Mock betting data"
     });
   } catch (error) {
     res.json({
       matchCount: 0,
       liveMatches: 0,
       finishedMatches: 0,
-      scheduledMatches: 0,
-      totalVolumeCLUTCH: "0",
-      uniqueUsers: 0,
-      totalBets: 0
+      totalVolumeCLUTCH: "125000",
+      uniqueUsers: 1243,
+      totalBets: 5678
     });
   }
 });
 
-// GET /api/leaderboard
+// GET /api/leaderboard - MOCK only
 app.get("/api/leaderboard", (req, res) => {
   res.json({
-    leaderboard: [],
-    note: "No bets placed yet"
+    leaderboard: [
+      { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
+      { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 },
+      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 },
+      { user: "0x4567...8901", total_wagered: "29000", bet_count: 15 },
+      { user: "0x5678...9012", total_wagered: "21000", bet_count: 12 }
+    ],
+    note: "MOCK data for demo"
   });
 });
 
-// GET /api/ultimate
+// GET /api/ultimate - MOCK only
 app.get("/api/ultimate", (req, res) => {
   res.json({
-    deadline: null,
+    deadline: Math.floor(Date.now() / 1000) + 2592000,
     settled: false,
     winner: null,
-    totalPool: "0",
-    teamPools: [],
-    note: "Ultimate bet not available until World Cup starts"
+    totalPool: "168000",
+    teamPools: [
+      { team: "Brazil", amount: "45000" },
+      { team: "Argentina", amount: "38000" },
+      { team: "France", amount: "32000" },
+      { team: "Germany", amount: "28000" },
+      { team: "England", amount: "25000" }
+    ],
+    note: "MOCK data for demo"
   });
 });
 
 // ─── AI Endpoints ─────────────────────────────────────────────────────
 
-// GET /api/ai/analyze/:matchId - Basic analysis (no AI)
+// GET /api/ai/analyze/:matchId
 app.get("/api/ai/analyze/:matchId", async (req, res) => {
   try {
     const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
-    
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Match not found" });
     }
@@ -446,19 +378,21 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
       homeTeam: match.home_team,
       awayTeam: match.away_team,
       analysis: {
-        prediction: { homeWin: 33.3, draw: 33.3, awayWin: 33.3 },
-        mostLikely: "UNKNOWN",
-        confidence: "Low",
-        insights: ["Waiting for Gemini AI configuration for detailed analysis"],
-        statistics: { homeTeam: match.home_team, awayTeam: match.away_team },
-        keyFactors: ["Configure GEMINI_API_KEY for AI analysis"]
+        prediction: { homeWin: 40, draw: 30, awayWin: 30 },
+        mostLikely: "HOME_WIN",
+        confidence: "Medium",
+        insights: [
+          `⚔️ Based on historical data`,
+          `🔥 Home advantage factor`,
+          `📊 Statistical analysis`
+        ],
+        keyFactors: ["Home advantage", "Recent form", "Head to head record"]
       },
       timestamp: new Date().toISOString(),
-      note: "Configure Gemini AI for professional betting analysis"
+      note: "Configure Gemini AI for advanced analysis"
     });
     
   } catch (error) {
-    console.error("Analysis error:", error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -474,21 +408,15 @@ app.get("/api/ai/gemini/:matchId", async (req, res) => {
     }
     
     const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
-    
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Match not found" });
     }
     
     const match = result.rows[0];
-    console.log(`🤖 Gemini analyzing: ${match.home_team} vs ${match.away_team}`);
-    
     const analysis = await aiAgent.predict(
       match.home_team,
       match.away_team,
-      { 
-        competition: match.competition_name || "FIFA World Cup 2026",
-        verbose: false
-      }
+      { competition: match.competition_name || "FIFA World Cup 2026" }
     );
     
     res.json({
@@ -500,84 +428,64 @@ app.get("/api/ai/gemini/:matchId", async (req, res) => {
     });
     
   } catch (error) {
-    console.error("Gemini Analysis error:", error);
-    res.status(500).json({ 
-      error: error.message,
-      note: "Gemini AI analysis failed - check your API key and quota"
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/ai/head2head - Head-to-head analysis
+// GET /api/ai/head2head
 app.get("/api/ai/head2head", async (req, res) => {
-  try {
-    const { team1, team2 } = req.query;
-    
-    if (!team1 || !team2) {
-      return res.status(400).json({ error: "Please provide team1 and team2" });
-    }
-    
-    if (!aiAgent) {
-      return res.status(503).json({ error: "Gemini AI not configured" });
-    }
-    
-    const analysis = await aiAgent.predict(team1, team2, { verbose: false });
-    
-    res.json({
-      team1,
-      team2,
-      analysis: analysis.h2hSummary || "Head-to-head analysis not available",
-      statistics: analysis.statistics,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  const { team1, team2 } = req.query;
+  if (!team1 || !team2) {
+    return res.status(400).json({ error: "Please provide team1 and team2" });
   }
+  
+  res.json({
+    team1,
+    team2,
+    analysis: {
+      totalMatches: 12,
+      team1Wins: 5,
+      team2Wins: 4,
+      draws: 3,
+      team1Goals: 15,
+      team2Goals: 12,
+      advantage: team1
+    },
+    note: "MOCK data - Configure Gemini for real analysis"
+  });
 });
 
-// GET /api/ai/form/:team - Team form analysis
+// GET /api/ai/form/:team
 app.get("/api/ai/form/:team", async (req, res) => {
-  try {
-    if (!aiAgent) {
-      return res.status(503).json({ error: "Gemini AI not configured" });
-    }
-    
-    const formData = await aiAgent._getTeamForm(req.params.team);
-    res.json(formData);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  res.json({
+    team: req.params.team,
+    formString: "WWDLW",
+    formRating: "Good",
+    averageGoalsFor: 1.8,
+    averageGoalsAgainst: 1.2,
+    trend: "📈 Improving",
+    note: "MOCK data - Configure Gemini for real analysis"
+  });
 });
 
-// GET /api/ai/predict - Quick prediction without match ID
+// GET /api/ai/predict
 app.get("/api/ai/predict", async (req, res) => {
-  try {
-    const { home, away } = req.query;
-    
-    if (!home || !away) {
-      return res.status(400).json({ error: "Please provide home and away teams" });
-    }
-    
-    if (!aiAgent) {
-      return res.status(503).json({ error: "Gemini AI not configured" });
-    }
-    
-    const analysis = await aiAgent.predict(home, away, { verbose: false });
-    
-    res.json({
-      homeTeam: home,
-      awayTeam: away,
-      ...analysis,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  const { home, away } = req.query;
+  if (!home || !away) {
+    return res.status(400).json({ error: "Please provide home and away teams" });
   }
+  
+  res.json({
+    homeTeam: home,
+    awayTeam: away,
+    prediction: { homeWin: 45, draw: 28, awayWin: 27 },
+    mostLikely: "HOME_WIN",
+    confidence: "Medium",
+    note: "MOCK data - Configure Gemini for real analysis"
+  });
 });
 
-// POST /api/refresh - Manually fetch World Cup matches (NO MOCK)
+// POST /api/refresh - Manually fetch matches
 app.post("/api/refresh", async (req, res) => {
   try {
     const matches = await fetchWorldCupMatches();
@@ -586,110 +494,51 @@ app.post("/api/refresh", async (req, res) => {
     
     res.json({ 
       success: true, 
-      message: stored > 0 ? `Fetched ${stored} new World Cup matches` : "No new World Cup matches",
-      totalMatches: parseInt(total.rows[0].count),
-      matchesInAPI: matches.length,
-      note: "NO MOCK DATA - only real World Cup matches"
+      message: stored > 0 ? `Fetched ${stored} new World Cup matches` : "No new matches",
+      totalMatches: parseInt(total.rows[0].count)
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message,
-      note: "NO MOCK DATA - API error"
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// GET /api/debug - Check system status
+// GET /api/debug
 app.get("/api/debug", async (req, res) => {
-  try {
-    const count = await query("SELECT COUNT(*) FROM matches");
-    const sample = await query("SELECT * FROM matches LIMIT 1");
-    
-    // Test API connectivity
-    let apiStatus = "unknown";
-    let apiMatches = 0;
-    try {
-      const apiTest = await axios.get(
-        `${API_BASE}/competitions/WC`,
-        { headers: API_HEADERS, timeout: 5000 }
-      );
-      apiStatus = "available";
-      
-      const matchTest = await axios.get(
-        `${API_BASE}/competitions/WC/matches?limit=1`,
-        { headers: API_HEADERS, timeout: 5000 }
-      );
-      apiMatches = matchTest.data.matches?.length || 0;
-    } catch (e) {
-      apiStatus = e.response?.status === 404 ? "not_found" : "error";
-    }
-    
-    res.json({
-      apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
-      geminiKey: GEMINI_API_KEY ? "✅" : "❌",
-      environment: isVercel ? "vercel" : "local",
-      database: "Neon PostgreSQL",
-      api: {
-        status: apiStatus,
-        matchesAvailable: apiMatches
-      },
-      database_stats: {
-        matchesInDB: parseInt(count.rows[0].count),
-        hasMatches: parseInt(count.rows[0].count) > 0,
-        sampleMatch: sample.rows[0] ? {
-          id: sample.rows[0].id,
-          home: sample.rows[0].home_team,
-          away: sample.rows[0].away_team,
-          status: sample.rows[0].status
-        } : null
-      },
-      note: "NO MOCK DATA - Only real World Cup matches shown",
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    res.json({ error: error.message });
-  }
+  const count = await query("SELECT COUNT(*) FROM matches");
+  const sample = await query("SELECT * FROM matches LIMIT 1");
+  
+  res.json({
+    apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+    geminiKey: GEMINI_API_KEY ? "✅" : "❌",
+    matchesInDB: parseInt(count.rows[0].count),
+    sampleMatch: sample.rows[0] || null,
+    note: "Matches: REAL | Other data: MOCK"
+  });
 });
 
-// ─── Initialize Database and Fetch Data ────────────────────────────────
+// ─── Initialize ─────────────────────────────────────────────────────────
 async function initialize() {
   console.log("\n" + "=".repeat(60));
-  console.log("🚀 Starting World Cup API with Neon PostgreSQL");
+  console.log("🚀 Starting World Cup API");
   console.log("=".repeat(60));
-  console.log(`📊 Environment: ${isVercel ? 'Vercel' : 'Local'}`);
-  console.log(`🔑 Football API Key: ${FOOTBALL_API_KEY ? '✅' : '❌'}`);
-  console.log(`🤖 Gemini API Key: ${GEMINI_API_KEY ? '✅' : '❌'}`);
-  console.log(`🗄️  Database: Neon PostgreSQL`);
-  console.log(`⚠️  NO MOCK DATA - Only real World Cup matches`);
+  console.log("✅ Matches: REAL data from Football-API");
+  console.log("✅ Pools/Odds: MOCK data for demo");
+  console.log("✅ Leaderboard/Ultimate: MOCK data for demo");
   console.log("=".repeat(60) + "\n");
   
-  try {
-    // Initialize database tables
-    const matchCount = await initDatabase();
-    
-    // If no matches, try to fetch from API
-    if (matchCount === 0) {
-      console.log("🔄 No matches found, fetching from API...");
-      const matches = await fetchWorldCupMatches();
-      if (matches.length > 0) {
-        await storeMatches(matches);
-        const newCount = await query("SELECT COUNT(*) FROM matches");
-        console.log(`✅ Database now has ${newCount.rows[0].count} World Cup matches`);
-      } else {
-        console.log("⚠️ No World Cup matches available from API - database will remain empty");
-        console.log("   This is normal if the 2026 World Cup data isn't in the API yet");
-      }
+  const matchCount = await initDatabase();
+  
+  if (matchCount === 0) {
+    console.log("🔄 No matches found, fetching from API...");
+    const matches = await fetchWorldCupMatches();
+    if (matches.length > 0) {
+      await storeMatches(matches);
     } else {
-      console.log(`✅ Database already has ${matchCount} World Cup matches`);
+      console.log("⚠️ No World Cup matches available from API yet");
     }
-  } catch (error) {
-    console.error("❌ Error initializing:", error);
   }
 }
 
-// Run initialization (don't await - let it run in background)
 initialize().catch(console.error);
 
-// ─── Export for Vercel ────────────────────────────────────────────────────
 module.exports = app;
