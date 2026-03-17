@@ -277,7 +277,9 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
   try {
     console.log(`🔍 AI analyze requested for match: ${req.params.matchId}`);
     
-    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
+    // FIXED: Using req.params.matchId (not req.params.id)
+    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.matchId]);
+    
     if (result.rows.length === 0) {
       console.log(`❌ Match ${req.params.matchId} not found in DB`);
       return res.status(404).json({ error: "Match not found" });
@@ -321,7 +323,9 @@ app.get("/api/ai/gemini/:matchId", async (req, res) => {
       });
     }
     
-    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
+    // FIXED: Using req.params.matchId (not req.params.id)
+    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.matchId]);
+    
     if (result.rows.length === 0) {
       return res.status(404).json({ error: "Match not found" });
     }
