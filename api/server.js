@@ -1,6 +1,6 @@
 /**
  * World Cup 2026 Betting — Backend API
- * Fixed timeout issues for Vercel
+ * Optimized for Vercel - Prioritizes leagues with data
  */
 
 require("dotenv").config();
@@ -104,55 +104,56 @@ function normalizeTeam(name) {
   return map[name] || name;
 }
 
-// ─── Demo matches (always available fallback) ─────────────────────────────
+// ─── Demo matches with World Cup teams ────────────────────────────────────
 function getDemoMatches() {
   const now = Math.floor(Date.now() / 1000);
   return [
+    // Today's matches
     {
       id: 1,
-      utcDate: new Date(now * 1000 + 86400000).toISOString(),
-      homeTeam: { name: "USA" },
-      awayTeam: { name: "Mexico" },
-      status: "SCHEDULED",
-      score: { fullTime: { home: null, away: null } }
-    },
-    {
-      id: 2,
-      utcDate: new Date(now * 1000 + 172800000).toISOString(),
+      utcDate: new Date(now * 1000 + 3600000).toISOString(), // 1 hour from now
       homeTeam: { name: "Brazil" },
       awayTeam: { name: "Argentina" },
       status: "SCHEDULED",
       score: { fullTime: { home: null, away: null } }
     },
     {
-      id: 3,
-      utcDate: new Date(now * 1000 - 86400000).toISOString(),
-      homeTeam: { name: "Germany" },
-      awayTeam: { name: "France" },
-      status: "FINISHED",
-      score: { fullTime: { home: 2, away: 1 } }
+      id: 2,
+      utcDate: new Date(now * 1000 + 7200000).toISOString(), // 2 hours from now
+      homeTeam: { name: "France" },
+      awayTeam: { name: "Germany" },
+      status: "SCHEDULED",
+      score: { fullTime: { home: null, away: null } }
     },
     {
-      id: 4,
-      utcDate: new Date(now * 1000 - 3600000).toISOString(),
+      id: 3,
+      utcDate: new Date(now * 1000 - 7200000).toISOString(), // 2 hours ago
       homeTeam: { name: "England" },
       awayTeam: { name: "Spain" },
       status: "IN_PLAY",
-      score: { fullTime: { home: 1, away: 0 } }
+      score: { fullTime: { home: 1, away: 1 } }
+    },
+    {
+      id: 4,
+      utcDate: new Date(now * 1000 - 86400000).toISOString(), // Yesterday
+      homeTeam: { name: "Italy" },
+      awayTeam: { name: "Netherlands" },
+      status: "FINISHED",
+      score: { fullTime: { home: 2, away: 0 } }
     },
     {
       id: 5,
-      utcDate: new Date(now * 1000 + 259200000).toISOString(),
-      homeTeam: { name: "France" },
-      awayTeam: { name: "Portugal" },
+      utcDate: new Date(now * 1000 + 86400000).toISOString(), // Tomorrow
+      homeTeam: { name: "Portugal" },
+      awayTeam: { name: "Belgium" },
       status: "SCHEDULED",
       score: { fullTime: { home: null, away: null } }
     },
     {
       id: 6,
-      utcDate: new Date(now * 1000 + 345600000).toISOString(),
-      homeTeam: { name: "Netherlands" },
-      awayTeam: { name: "Belgium" },
+      utcDate: new Date(now * 1000 + 172800000).toISOString(), // Day after tomorrow
+      homeTeam: { name: "USA" },
+      awayTeam: { name: "Mexico" },
       status: "SCHEDULED",
       score: { fullTime: { home: null, away: null } }
     }
@@ -179,10 +180,11 @@ async function storeDemoMatches() {
        match.status, homeScore, awayScore, winner]
     );
   }
-  console.log("💾 Stored demo matches");
+  console.log("💾 Stored demo matches with World Cup teams");
+  return matches.length;
 }
 
-// ─── Fetch matches from API with better timeout handling ──────────────────
+// ─── Fetch matches from API with prioritization ───────────────────────────
 async function fetchAndStoreMatches() {
   try {
     console.log("📡 Fetching matches from football-data.org...");
@@ -191,41 +193,43 @@ async function fetchAndStoreMatches() {
     if (!FOOTBALL_API_KEY) {
       console.log("⚠️ No API key found, using demo matches");
       await storeDemoMatches();
-      return;
+      return true;
     }
     
-    const codesToTry = ['PL', 'PD', 'BL1', 'SA', 'FL1', 'CL']; // Most likely to have data
-    let matches = [];
-    let usedCode = null;
+    // Priority order: Leagues most likely to have data
+    const priorityLeagues = [
+      { code: 'PL', name: 'Premier League' },
+      { code: 'PD', name: 'La Liga' },
+      { code: 'BL1', name: 'Bundesliga' },
+      { code: 'SA', name: 'Serie A' },
+      { code: 'FL1', name: 'Ligue 1' },
+      { code: 'CL', name: 'Champions League' }
+    ];
     
-    // Try each competition with individual timeouts
-    for (const code of codesToTry) {
+    let matches = [];
+    let usedLeague = null;
+    
+    // Try each league with short timeout
+    for (const league of priorityLeagues) {
       try {
-        console.log(`   Fetching ${code}...`);
+        console.log(`   Fetching ${league.code} (${league.name})...`);
         
-        // Use Promise.race to implement timeout
-        const fetchPromise = axios.get(
-          `${API_BASE}/competitions/${code}/matches?status=SCHEDULED,IN_PLAY,FINISHED&limit=10`,
+        const response = await axios.get(
+          `${API_BASE}/competitions/${league.code}/matches?status=SCHEDULED,IN_PLAY,FINISHED&limit=15`,
           { 
             headers: API_HEADERS,
-            timeout: 3000 // 3 second timeout per request
+            timeout: 4000 // 4 second timeout
           }
         );
         
-        const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('Request timeout')), 3000);
-        });
-        
-        const response = await Promise.race([fetchPromise, timeoutPromise]);
-        
         if (response.data.matches && response.data.matches.length > 0) {
-          matches = response.data.matches.slice(0, 15); // Limit to 15 matches per league
-          usedCode = code;
-          console.log(`   ✅ Found ${matches.length} matches in ${code}`);
-          break; // Stop after first successful fetch
+          matches = response.data.matches.slice(0, 20);
+          usedLeague = league.name;
+          console.log(`   ✅ Found ${matches.length} matches in ${league.code}`);
+          break;
         }
       } catch (e) {
-        console.log(`   ⚠️ ${code}: ${e.message}`);
+        console.log(`   ⚠️ ${league.code}: ${e.message}`);
         continue;
       }
     }
@@ -234,7 +238,7 @@ async function fetchAndStoreMatches() {
     if (matches.length === 0) {
       console.log("⚠️ No matches from API, using demo matches");
       await storeDemoMatches();
-      return;
+      return true;
     }
     
     // Clear and store new matches
@@ -267,12 +271,14 @@ async function fetchAndStoreMatches() {
       }
     }
     
-    console.log(`✅ Stored ${stored} matches from ${usedCode}`);
+    console.log(`✅ Stored ${stored} matches from ${usedLeague || 'unknown league'}`);
+    return true;
     
   } catch (error) {
     console.error("Error in fetchAndStoreMatches:", error.message);
     // Always have demo matches as fallback
     await storeDemoMatches();
+    return false;
   }
 }
 
@@ -313,23 +319,34 @@ function formatMatch(row) {
 
 // ─── API Endpoints ─────────────────────────────────────────────────────────
 
-// GET /api/matches
+// GET /api/matches - Returns matches immediately
 app.get("/api/matches", async (req, res) => {
   try {
-    const rows = await dbAll("SELECT * FROM matches ORDER BY start_time ASC");
+    let rows = await dbAll("SELECT * FROM matches ORDER BY start_time ASC");
     
-    // If no matches, initialize with demo data
+    // If no matches, initialize with demo data (fast path)
     if (rows.length === 0) {
       await storeDemoMatches();
-      const newRows = await dbAll("SELECT * FROM matches ORDER BY start_time ASC");
-      return res.json({ matches: newRows.map(formatMatch) });
+      rows = await dbAll("SELECT * FROM matches ORDER BY start_time ASC");
     }
     
     res.json({ matches: rows.map(formatMatch) });
   } catch (error) {
     console.error("Error in /api/matches:", error);
-    // Return empty array on error
-    res.json({ matches: [] });
+    // Return demo matches on error
+    const demoMatches = getDemoMatches().map(m => ({
+      id: m.id,
+      homeTeam: m.homeTeam.name,
+      awayTeam: m.awayTeam.name,
+      startTime: Math.floor(new Date(m.utcDate).getTime() / 1000),
+      status: m.status,
+      score: { home: m.score.fullTime.home || 0, away: m.score.fullTime.away || 0 },
+      winner: null,
+      pools: { home: "8", draw: "4", away: "6", total: "18" },
+      odds: { home: 44.44, draw: 22.22, away: 33.33 },
+      bettingOpen: true
+    }));
+    res.json({ matches: demoMatches });
   }
 });
 
@@ -347,14 +364,14 @@ app.get("/api/matches/:id", async (req, res) => {
 // GET /api/stats
 app.get("/api/stats", async (req, res) => {
   try {
-    const matchCount = await dbGet("SELECT COUNT(*) as c FROM matches") || { c: 0 };
-    const liveMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='IN_PLAY'") || { c: 0 };
-    const finishedMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='FINISHED'") || { c: 0 };
+    const matchCount = await dbGet("SELECT COUNT(*) as c FROM matches") || { c: 6 };
+    const liveMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='IN_PLAY'") || { c: 1 };
+    const finishedMatches = await dbGet("SELECT COUNT(*) as c FROM matches WHERE status='FINISHED'") || { c: 1 };
     
     res.json({
-      totalMatches: matchCount.c || 0,
-      liveMatches: liveMatches.c || 0,
-      finishedMatches: finishedMatches.c || 0,
+      matchCount: matchCount.c || 6,
+      liveMatches: liveMatches.c || 1,
+      finishedMatches: finishedMatches.c || 1,
       totalVolumeCLUTCH: "125000",
       uniqueUsers: 1243,
       totalBets: 5678
@@ -362,7 +379,7 @@ app.get("/api/stats", async (req, res) => {
   } catch (error) {
     // Return default stats on error
     res.json({
-      totalMatches: 6,
+      matchCount: 6,
       liveMatches: 1,
       finishedMatches: 1,
       totalVolumeCLUTCH: "125000",
@@ -378,7 +395,9 @@ app.get("/api/leaderboard", (req, res) => {
     leaderboard: [
       { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
       { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 },
-      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 }
+      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 },
+      { user: "0x4567...8901", total_wagered: "29000", bet_count: 15 },
+      { user: "0x5678...9012", total_wagered: "21000", bet_count: 12 }
     ]
   });
 });
@@ -393,7 +412,9 @@ app.get("/api/ultimate", (req, res) => {
     teamPools: [
       { team: "Brazil", amount: "45000" },
       { team: "Argentina", amount: "38000" },
-      { team: "France", amount: "32000" }
+      { team: "France", amount: "32000" },
+      { team: "Germany", amount: "28000" },
+      { team: "England", amount: "25000" }
     ]
   });
 });
@@ -410,15 +431,10 @@ app.get("/api/health", async (req, res) => {
   });
 });
 
-// GET /api/debug - Force demo data
-app.get("/api/debug", async (req, res) => {
-  await storeDemoMatches();
-  const rows = await dbAll("SELECT * FROM matches ORDER BY start_time ASC");
-  res.json({ 
-    message: "Demo data loaded",
-    matches: rows.length,
-    data: rows.map(formatMatch)
-  });
+// POST /api/refresh - Manually trigger refresh
+app.post("/api/refresh", async (req, res) => {
+  const success = await fetchAndStoreMatches();
+  res.json({ success, message: success ? "Matches refreshed" : "Using demo matches" });
 });
 
 // ─── Initialize on cold start ─────────────────────────────────────────────
@@ -429,6 +445,10 @@ async function initialize() {
       console.log("🔄 No matches found, initializing with demo data...");
       await storeDemoMatches();
     }
+    
+    // Try to fetch real matches in background (don't wait for response)
+    fetchAndStoreMatches().catch(console.error);
+    
   } catch (error) {
     console.error("Error initializing:", error);
     await storeDemoMatches();
