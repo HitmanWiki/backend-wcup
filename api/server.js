@@ -1,6 +1,6 @@
 /**
  * World Cup 2026 Betting — Backend API
- * ONLY World Cup matches + AI Analysis
+ * ONLY World Cup matches + Gemini AI Analysis
  */
 
 require("dotenv").config();
@@ -8,7 +8,7 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const sqlite3 = require("sqlite3").verbose();
-const AIAnalysisAgent = require('./ai-analysis.js');
+const AIMatchAgent = require('./ai-match-agent.js');
 
 const app = express();
 app.use(cors());
@@ -16,10 +16,15 @@ app.use(express.json());
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const FOOTBALL_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const isVercel = process.env.VERCEL === '1';
 
 if (!FOOTBALL_API_KEY) {
   console.error("❌ FATAL: FOOTBALL_DATA_API_KEY not found in environment");
+}
+if (!GEMINI_API_KEY) {
+  console.error("⚠️ WARNING: GEMINI_API_KEY not found - AI analysis will be limited");
 }
 
 // ─── Database Setup ──────────────────────────────────────────────────────
@@ -82,8 +87,20 @@ db.serialize(() => {
 const API_BASE = "https://api.football-data.org/v4";
 const API_HEADERS = FOOTBALL_API_KEY ? { "X-Auth-Token": FOOTBALL_API_KEY } : {};
 
-// Initialize AI Agent
-const aiAgent = new AIAnalysisAgent(FOOTBALL_API_KEY);
+// Initialize Gemini AI Agent (if API key exists)
+let aiAgent = null;
+if (GEMINI_API_KEY) {
+  try {
+    aiAgent = new AIMatchAgent({
+      geminiApiKey: GEMINI_API_KEY,
+      footballApiKey: FOOTBALL_API_KEY,
+      newsApiKey: NEWS_API_KEY
+    });
+    console.log("✅ Gemini AI Agent initialized");
+  } catch (error) {
+    console.error("❌ Failed to initialize Gemini AI Agent:", error.message);
+  }
+}
 
 // ─── Helper: Normalize team names ─────────────────────────────────────────
 function normalizeTeam(name) {
@@ -226,6 +243,7 @@ app.get("/", (req, res) => {
     description: "ONLY real World Cup data - NO DEMO",
     status: "running",
     environment: isVercel ? "vercel" : "local",
+    aiStatus: aiAgent ? "✅ Gemini AI Active" : "❌ Gemini AI Not Configured",
     endpoints: {
       health: "/api/health",
       matches: "/api/matches",
@@ -235,6 +253,7 @@ app.get("/", (req, res) => {
       ultimate: "/api/ultimate",
       ai: {
         analyze: "/api/ai/analyze/:matchId",
+        gemini: "/api/ai/gemini/:matchId",
         head2head: "/api/ai/head2head",
         form: "/api/ai/form/:team",
         predict: "/api/ai/predict"
@@ -254,6 +273,7 @@ app.get("/api/health", async (req, res) => {
       matchesInDB: count?.c || 0,
       source: count?.c > 0 ? "Real World Cup data" : "No World Cup data available",
       apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+      geminiKey: GEMINI_API_KEY ? "✅" : "❌",
       environment: isVercel ? "vercel" : "local",
       timestamp: new Date().toISOString()
     });
@@ -348,7 +368,7 @@ app.get("/api/ultimate", (req, res) => {
 
 // ─── AI Endpoints ─────────────────────────────────────────────────────
 
-// GET /api/ai/analyze/:matchId - AI analysis for a specific match
+// GET /api/ai/analyze/:matchId - Statistical analysis (fallback)
 app.get("/api/ai/analyze/:matchId", async (req, res) => {
   try {
     const match = await dbGet("SELECT * FROM matches WHERE id=?", [req.params.id]);
@@ -357,19 +377,79 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
       return res.status(404).json({ error: "Match not found" });
     }
     
-    const analysis = await aiAgent.predictOutcome(match.home_team, match.away_team);
+    // Simple statistical analysis
+    const analysis = {
+      prediction: {
+        homeWin: 40,
+        draw: 30,
+        awayWin: 30
+      },
+      mostLikely: 'UNKNOWN',
+      confidence: 'Low',
+      insights: ['Basic statistical analysis - upgrade to Gemini for better predictions'],
+      statistics: {
+        homeTeam: match.home_team,
+        awayTeam: match.away_team
+      },
+      keyFactors: ['Upgrade to Gemini AI for detailed analysis']
+    };
     
     res.json({
       matchId: match.id,
       homeTeam: match.home_team,
       awayTeam: match.away_team,
       analysis,
+      timestamp: new Date().toISOString(),
+      note: "Upgrade to Gemini AI for professional betting analysis"
+    });
+    
+  } catch (error) {
+    console.error("Analysis error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/gemini/:matchId - Gemini AI powered analysis
+app.get("/api/ai/gemini/:matchId", async (req, res) => {
+  try {
+    if (!aiAgent) {
+      return res.status(503).json({ 
+        error: "Gemini AI not configured",
+        message: "Please set GEMINI_API_KEY environment variable"
+      });
+    }
+    
+    const match = await dbGet("SELECT * FROM matches WHERE id=?", [req.params.id]);
+    
+    if (!match) {
+      return res.status(404).json({ error: "Match not found" });
+    }
+    
+    console.log(`🤖 Gemini analyzing: ${match.home_team} vs ${match.away_team}`);
+    
+    const analysis = await aiAgent.predict(
+      match.home_team,
+      match.away_team,
+      { 
+        competition: match.competition_name || "FIFA World Cup 2026",
+        verbose: false
+      }
+    );
+    
+    res.json({
+      matchId: match.id,
+      homeTeam: match.home_team,
+      awayTeam: match.away_team,
+      ...analysis,
       timestamp: new Date().toISOString()
     });
     
   } catch (error) {
-    console.error("AI Analysis error:", error);
-    res.status(500).json({ error: error.message });
+    console.error("Gemini Analysis error:", error);
+    res.status(500).json({ 
+      error: error.message,
+      note: "Gemini AI analysis failed - check your API key and quota"
+    });
   }
 });
 
@@ -382,12 +462,18 @@ app.get("/api/ai/head2head", async (req, res) => {
       return res.status(400).json({ error: "Please provide team1 and team2" });
     }
     
-    const h2h = await aiAgent.getHeadToHead(team1, team2);
+    if (!aiAgent) {
+      return res.status(503).json({ error: "Gemini AI not configured" });
+    }
+    
+    // We'll reuse the predict method but extract H2H data
+    const analysis = await aiAgent.predict(team1, team2, { verbose: false });
     
     res.json({
       team1,
       team2,
-      analysis: h2h,
+      analysis: analysis.h2hSummary || "Head-to-head analysis not available",
+      statistics: analysis.statistics,
       timestamp: new Date().toISOString()
     });
     
@@ -399,14 +485,19 @@ app.get("/api/ai/head2head", async (req, res) => {
 // GET /api/ai/form/:team - Team form analysis
 app.get("/api/ai/form/:team", async (req, res) => {
   try {
-    const form = await aiAgent.getTeamForm(req.params.team);
-    res.json(form);
+    if (!aiAgent) {
+      return res.status(503).json({ error: "Gemini AI not configured" });
+    }
+    
+    // Access the internal tool directly (bypassing Gemini for speed)
+    const formData = await aiAgent._getTeamForm(req.params.team);
+    res.json(formData);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/ai/predict - Predict match outcome
+// GET /api/ai/predict - Quick prediction without match ID
 app.get("/api/ai/predict", async (req, res) => {
   try {
     const { home, away } = req.query;
@@ -415,12 +506,16 @@ app.get("/api/ai/predict", async (req, res) => {
       return res.status(400).json({ error: "Please provide home and away teams" });
     }
     
-    const prediction = await aiAgent.predictOutcome(home, away);
+    if (!aiAgent) {
+      return res.status(503).json({ error: "Gemini AI not configured" });
+    }
+    
+    const analysis = await aiAgent.predict(home, away, { verbose: false });
     
     res.json({
       homeTeam: home,
       awayTeam: away,
-      prediction,
+      ...analysis,
       timestamp: new Date().toISOString()
     });
     
@@ -475,6 +570,7 @@ app.get("/api/debug", async (req, res) => {
     
     res.json({
       apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+      geminiKey: GEMINI_API_KEY ? "✅" : "❌",
       environment: isVercel ? "vercel" : "local",
       worldCup: {
         availableInAPI: wcAvailable,
@@ -499,11 +595,27 @@ app.get("/api/debug", async (req, res) => {
   }
 });
 
+// POST /api/ai/clear-cache - Clear AI agent caches (protected)
+app.post("/api/ai/clear-cache", async (req, res) => {
+  const { secret } = req.body;
+  if (secret !== process.env.ADMIN_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  
+  if (aiAgent) {
+    aiAgent.clearCaches();
+    res.json({ success: true, message: "AI agent caches cleared" });
+  } else {
+    res.json({ success: false, message: "AI agent not initialized" });
+  }
+});
+
 // ─── Initialize - ONLY fetch World Cup, NO DEMO ─────────────────────────
 async function initialize() {
   console.log("\n🚀 Starting World Cup API...");
   console.log(`📊 Environment: ${isVercel ? 'Vercel' : 'Local'}`);
-  console.log(`🔑 API Key: ${FOOTBALL_API_KEY ? '✅' : '❌'}`);
+  console.log(`🔑 Football API Key: ${FOOTBALL_API_KEY ? '✅' : '❌'}`);
+  console.log(`🤖 Gemini API Key: ${GEMINI_API_KEY ? '✅' : '❌'}`);
   console.log(`📁 Database: ${dbPath}`);
   console.log(`⚠️  NO DEMO DATA - Only real World Cup matches`);
   
