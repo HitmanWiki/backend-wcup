@@ -1,6 +1,6 @@
 /**
  * AI Match Analysis Agent — Gemini Edition
- * Brain  : Google Gemini 2.0 Flash (free tier)
+ * Brain  : Google Gemini 3.0 Flash (free tier)
  * Data   : football-data.org  +  NewsAPI (both free tiers available)
  * Pattern: Agentic loop — Gemini decides which tools to call and when
  *
@@ -30,7 +30,7 @@ class AIMatchAgent {
     this.CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
     // ── Agent config ───────────────────────────────────────────────────
-    this.model = "gemini-2.0-flash";
+    this.model = "gemini-3.0-flash";
     this.maxIterations = 10;
     this.config = {
       homeAdvantage: 1.25,
