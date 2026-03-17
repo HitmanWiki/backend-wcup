@@ -217,7 +217,9 @@ function formatMatch(row) {
   };
 }
 
-// ─── API Endpoints ─────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+//  API ENDPOINTS - AI ROUTES FIRST (important for route matching)
+// ═══════════════════════════════════════════════════════════════════════
 
 // Root endpoint
 app.get("/", (req, res) => {
@@ -268,6 +270,140 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// ==================== AI ENDPOINTS ====================
+
+// GET /api/ai/analyze/:matchId - Basic AI analysis
+app.get("/api/ai/analyze/:matchId", async (req, res) => {
+  try {
+    console.log(`🔍 AI analyze requested for match: ${req.params.matchId}`);
+    
+    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0) {
+      console.log(`❌ Match ${req.params.matchId} not found in DB`);
+      return res.status(404).json({ error: "Match not found" });
+    }
+    
+    const match = result.rows[0];
+    console.log(`✅ Match found: ${match.home_team} vs ${match.away_team}`);
+    
+    res.json({
+      matchId: match.id,
+      homeTeam: match.home_team,
+      awayTeam: match.away_team,
+      analysis: {
+        prediction: { homeWin: 40, draw: 30, awayWin: 30 },
+        mostLikely: "HOME_WIN",
+        confidence: "Medium",
+        insights: [
+          `⚔️ Based on historical data`,
+          `🔥 Home advantage factor`,
+          `📊 Statistical analysis`
+        ],
+        keyFactors: ["Home advantage", "Recent form", "Head to head record"]
+      },
+      timestamp: new Date().toISOString(),
+      note: "Configure Gemini AI for advanced analysis"
+    });
+    
+  } catch (error) {
+    console.error("❌ AI Analysis error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/gemini/:matchId - Gemini AI powered analysis (if configured)
+app.get("/api/ai/gemini/:matchId", async (req, res) => {
+  try {
+    if (!aiAgent) {
+      return res.status(503).json({ 
+        error: "Gemini AI not configured",
+        message: "Please set GEMINI_API_KEY environment variable"
+      });
+    }
+    
+    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Match not found" });
+    }
+    
+    const match = result.rows[0];
+    console.log(`🤖 Gemini analyzing: ${match.home_team} vs ${match.away_team}`);
+    
+    const analysis = await aiAgent.predict(
+      match.home_team,
+      match.away_team,
+      { competition: match.competition_name || "FIFA World Cup 2026" }
+    );
+    
+    res.json({
+      matchId: match.id,
+      homeTeam: match.home_team,
+      awayTeam: match.away_team,
+      ...analysis,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error("❌ Gemini Analysis error:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// GET /api/ai/head2head - Head to head analysis
+app.get("/api/ai/head2head", async (req, res) => {
+  const { team1, team2 } = req.query;
+  if (!team1 || !team2) {
+    return res.status(400).json({ error: "Please provide team1 and team2" });
+  }
+  
+  res.json({
+    team1,
+    team2,
+    analysis: {
+      totalMatches: 12,
+      team1Wins: 5,
+      team2Wins: 4,
+      draws: 3,
+      team1Goals: 15,
+      team2Goals: 12,
+      advantage: team1
+    },
+    note: "MOCK data - Configure Gemini for real analysis"
+  });
+});
+
+// GET /api/ai/form/:team - Team form analysis
+app.get("/api/ai/form/:team", async (req, res) => {
+  res.json({
+    team: req.params.team,
+    formString: "WWDLW",
+    formRating: "Good",
+    averageGoalsFor: 1.8,
+    averageGoalsAgainst: 1.2,
+    trend: "📈 Improving",
+    note: "MOCK data - Configure Gemini for real analysis"
+  });
+});
+
+// GET /api/ai/predict - Quick prediction
+app.get("/api/ai/predict", async (req, res) => {
+  const { home, away } = req.query;
+  if (!home || !away) {
+    return res.status(400).json({ error: "Please provide home and away teams" });
+  }
+  
+  res.json({
+    homeTeam: home,
+    awayTeam: away,
+    prediction: { homeWin: 45, draw: 28, awayWin: 27 },
+    mostLikely: "HOME_WIN",
+    confidence: "Medium",
+    note: "MOCK data - Configure Gemini for real analysis"
+  });
+});
+
+// ==================== MATCH ENDPOINTS ====================
+
 // GET /api/matches - REAL matches from API + MOCK pools/odds
 app.get("/api/matches", async (req, res) => {
   try {
@@ -298,6 +434,8 @@ app.get("/api/matches/:id", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ==================== STATS ENDPOINTS ====================
 
 // GET /api/stats - REAL match counts + MOCK betting data
 app.get("/api/stats", async (req, res) => {
@@ -358,130 +496,6 @@ app.get("/api/ultimate", (req, res) => {
       { team: "England", amount: "25000" }
     ],
     note: "MOCK data for demo"
-  });
-});
-
-// ─── AI Endpoints ─────────────────────────────────────────────────────
-
-// GET /api/ai/analyze/:matchId
-app.get("/api/ai/analyze/:matchId", async (req, res) => {
-  try {
-    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Match not found" });
-    }
-    
-    const match = result.rows[0];
-    
-    res.json({
-      matchId: match.id,
-      homeTeam: match.home_team,
-      awayTeam: match.away_team,
-      analysis: {
-        prediction: { homeWin: 40, draw: 30, awayWin: 30 },
-        mostLikely: "HOME_WIN",
-        confidence: "Medium",
-        insights: [
-          `⚔️ Based on historical data`,
-          `🔥 Home advantage factor`,
-          `📊 Statistical analysis`
-        ],
-        keyFactors: ["Home advantage", "Recent form", "Head to head record"]
-      },
-      timestamp: new Date().toISOString(),
-      note: "Configure Gemini AI for advanced analysis"
-    });
-    
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// GET /api/ai/gemini/:matchId - Gemini AI powered analysis (if configured)
-app.get("/api/ai/gemini/:matchId", async (req, res) => {
-  try {
-    if (!aiAgent) {
-      return res.status(503).json({ 
-        error: "Gemini AI not configured",
-        message: "Please set GEMINI_API_KEY environment variable"
-      });
-    }
-    
-    const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: "Match not found" });
-    }
-    
-    const match = result.rows[0];
-    const analysis = await aiAgent.predict(
-      match.home_team,
-      match.away_team,
-      { competition: match.competition_name || "FIFA World Cup 2026" }
-    );
-    
-    res.json({
-      matchId: match.id,
-      homeTeam: match.home_team,
-      awayTeam: match.away_team,
-      ...analysis,
-      timestamp: new Date().toISOString()
-    });
-    
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// GET /api/ai/head2head
-app.get("/api/ai/head2head", async (req, res) => {
-  const { team1, team2 } = req.query;
-  if (!team1 || !team2) {
-    return res.status(400).json({ error: "Please provide team1 and team2" });
-  }
-  
-  res.json({
-    team1,
-    team2,
-    analysis: {
-      totalMatches: 12,
-      team1Wins: 5,
-      team2Wins: 4,
-      draws: 3,
-      team1Goals: 15,
-      team2Goals: 12,
-      advantage: team1
-    },
-    note: "MOCK data - Configure Gemini for real analysis"
-  });
-});
-
-// GET /api/ai/form/:team
-app.get("/api/ai/form/:team", async (req, res) => {
-  res.json({
-    team: req.params.team,
-    formString: "WWDLW",
-    formRating: "Good",
-    averageGoalsFor: 1.8,
-    averageGoalsAgainst: 1.2,
-    trend: "📈 Improving",
-    note: "MOCK data - Configure Gemini for real analysis"
-  });
-});
-
-// GET /api/ai/predict
-app.get("/api/ai/predict", async (req, res) => {
-  const { home, away } = req.query;
-  if (!home || !away) {
-    return res.status(400).json({ error: "Please provide home and away teams" });
-  }
-  
-  res.json({
-    homeTeam: home,
-    awayTeam: away,
-    prediction: { homeWin: 45, draw: 28, awayWin: 27 },
-    mostLikely: "HOME_WIN",
-    confidence: "Medium",
-    note: "MOCK data - Configure Gemini for real analysis"
   });
 });
 
