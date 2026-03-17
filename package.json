@@ -4,7 +4,7 @@
   "description": "World Cup 2026 Betting Backend",
   "main": "api/server.js",
   "engines": {
-    "node": "20.x"
+    "node": "24.x"
   },
   "scripts": {
     "dev": "node api/server.js",
