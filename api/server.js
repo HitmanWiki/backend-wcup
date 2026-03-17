@@ -272,12 +272,11 @@ app.get("/api/health", async (req, res) => {
 
 // ==================== AI ENDPOINTS ====================
 
-// GET /api/ai/analyze/:matchId - Basic AI analysis
+// GET /api/ai/analyze/:matchId - ACTUAL AI ANALYSIS using your agent
 app.get("/api/ai/analyze/:matchId", async (req, res) => {
   try {
     console.log(`🔍 AI analyze requested for match: ${req.params.matchId}`);
     
-    // FIXED: Using req.params.matchId (not req.params.id)
     const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.matchId]);
     
     if (result.rows.length === 0) {
@@ -288,23 +287,47 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
     const match = result.rows[0];
     console.log(`✅ Match found: ${match.home_team} vs ${match.away_team}`);
     
+    // Check if AI agent is initialized
+    if (!aiAgent) {
+      console.log("⚠️ AI Agent not initialized, using mock data");
+      return res.json({
+        matchId: match.id,
+        homeTeam: match.home_team,
+        awayTeam: match.away_team,
+        analysis: {
+          prediction: { homeWin: 40, draw: 30, awayWin: 30 },
+          mostLikely: "HOME_WIN",
+          confidence: "Medium",
+          insights: [
+            `⚔️ Based on historical data`,
+            `🔥 Home advantage factor`,
+            `📊 Statistical analysis`
+          ],
+          keyFactors: ["Home advantage", "Recent form", "Head to head record"]
+        },
+        timestamp: new Date().toISOString(),
+        note: "Configure Gemini AI for advanced analysis"
+      });
+    }
+    
+    // Use the actual AI agent for real analysis
+    console.log("🤖 Using AI Agent for analysis");
+    const analysis = await aiAgent.predict(
+      match.home_team,
+      match.away_team,
+      { 
+        competition: match.competition_name || "FIFA World Cup 2026",
+        verbose: false 
+      }
+    );
+    
     res.json({
       matchId: match.id,
       homeTeam: match.home_team,
       awayTeam: match.away_team,
-      analysis: {
-        prediction: { homeWin: 40, draw: 30, awayWin: 30 },
-        mostLikely: "HOME_WIN",
-        confidence: "Medium",
-        insights: [
-          `⚔️ Based on historical data`,
-          `🔥 Home advantage factor`,
-          `📊 Statistical analysis`
-        ],
-        keyFactors: ["Home advantage", "Recent form", "Head to head record"]
-      },
+      ...analysis,
       timestamp: new Date().toISOString(),
-      note: "Configure Gemini AI for advanced analysis"
+      source: "AI Agent Analysis"
     });
     
   } catch (error) {
@@ -312,7 +335,6 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
-
 // GET /api/ai/gemini/:matchId - Gemini AI powered analysis (if configured)
 app.get("/api/ai/gemini/:matchId", async (req, res) => {
   try {
