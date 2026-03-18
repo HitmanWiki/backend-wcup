@@ -1,14 +1,13 @@
 /**
  * World Cup 2026 Betting — Backend API
- * Simple server that:
- * - Serves matches from Neon DB
- * - Connects to AI agent (which does its own Google search)
- * - Provides mock endpoints for frontend
+ * Fetches matches from API, caches in Neon DB
+ * Next requests served from DB
  */
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const axios = require("axios");
 const { Pool } = require("pg");
 const AIMatchAgent = require("./ai-match-agent.js");
 
@@ -17,8 +16,14 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Environment ────────────────────────────────────────────────────────
+const FOOTBALL_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!FOOTBALL_API_KEY) {
+  console.error("❌ FOOTBALL_API_KEY missing");
+  process.exit(1);
+}
 
 if (!GEMINI_API_KEY) {
   console.error("❌ GEMINI_API_KEY missing");
@@ -54,8 +59,9 @@ const query = async (text, params) => {
   }
 };
 
-// ─── Initialize matches table ──────────────────────────────────────────
+// ─── Initialize database tables ────────────────────────────────────────
 async function initDatabase() {
+  // Main matches table (cached from API)
   await query(`
     CREATE TABLE IF NOT EXISTS matches (
       id INTEGER PRIMARY KEY,
@@ -68,23 +74,165 @@ async function initDatabase() {
       winner TEXT,
       competition_code TEXT,
       competition_name TEXT,
+      season TEXT,
+      matchday INTEGER,
       last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
-  
+
+  // Cache metadata table
+  await query(`
+    CREATE TABLE IF NOT EXISTS cache_metadata (
+      key TEXT PRIMARY KEY,
+      last_fetched TIMESTAMP,
+      data_hash TEXT
+    );
+  `);
+
+  // Create indexes
+  await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
+
   const count = await query("SELECT COUNT(*) FROM matches");
-  console.log(`✅ DB ready — ${count.rows[0].count} matches`);
+  console.log(`✅ DB ready — ${count.rows[0].count} cached matches`);
+  return parseInt(count.rows[0].count);
 }
 
-// ─── AI Agent ──────────────────────────────────────────────────────────
+// ─── Football API ──────────────────────────────────────────────────────
+const API_BASE = "https://api.football-data.org/v4";
+const API_HEADERS = { "X-Auth-Token": FOOTBALL_API_KEY };
+
+const TEAM_NAME_MAP = {
+  "United States": "USA",
+  "Korea Republic": "South Korea",
+  "IR Iran": "Iran",
+  "Côte d'Ivoire": "Ivory Coast"
+};
+
+const normalizeTeam = (name) => TEAM_NAME_MAP[name] || name;
+
+// ─── Fetch from API and store in DB ────────────────────────────────────
+async function fetchAndCacheMatches() {
+  console.log("🌍 Fetching fresh matches from API...");
+  
+  try {
+    // Try World Cup first
+    let matches = [];
+    let source = null;
+    
+    // Try WC competition
+    try {
+      const wcResp = await axios.get(
+        `${API_BASE}/competitions/WC/matches`,
+        { headers: API_HEADERS, timeout: 10000 }
+      );
+      
+      if (wcResp.data.matches?.length > 0) {
+        matches = wcResp.data.matches;
+        source = "World Cup";
+        console.log(`✅ Found ${matches.length} World Cup matches`);
+      }
+    } catch (wcErr) {
+      console.log("⚠️ No World Cup data available, trying other competitions...");
+    }
+    
+    // If no WC matches, try other major tournaments
+    if (matches.length === 0) {
+      const otherComps = ['CL', 'PL', 'PD', 'BL1', 'SA', 'FL1'];
+      
+      for (const comp of otherComps) {
+        try {
+          const resp = await axios.get(
+            `${API_BASE}/competitions/${comp}/matches?status=SCHEDULED,FINISHED,IN_PLAY&limit=50`,
+            { headers: API_HEADERS, timeout: 5000 }
+          );
+          
+          if (resp.data.matches?.length > 0) {
+            matches = resp.data.matches.slice(0, 100); // Limit to 100 matches
+            source = comp;
+            console.log(`✅ Found ${matches.length} matches from ${comp}`);
+            break;
+          }
+        } catch (e) {
+          continue;
+        }
+      }
+    }
+    
+    if (matches.length === 0) {
+      console.log("⚠️ No matches found from any API source");
+      return 0;
+    }
+    
+    // Store matches in DB
+    let stored = 0;
+    for (const m of matches) {
+      const homeTeam = normalizeTeam(m.homeTeam?.name || "TBD");
+      const awayTeam = normalizeTeam(m.awayTeam?.name || "TBD");
+      const startTime = Math.floor(new Date(m.utcDate).getTime() / 1000);
+      const status = m.status || "SCHEDULED";
+      const homeScore = m.score?.fullTime?.home ?? 0;
+      const awayScore = m.score?.fullTime?.away ?? 0;
+      const season = m.season?.startDate?.split('-')[0] || "2026";
+      
+      const winner = status === "FINISHED" && homeScore !== awayScore
+        ? (homeScore > awayScore ? homeTeam : awayTeam)
+        : null;
+
+      try {
+        await query(
+          `INSERT INTO matches 
+           (id, home_team, away_team, start_time, status, home_score, away_score, winner, 
+            competition_code, competition_name, season, matchday)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+           ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            home_score = EXCLUDED.home_score,
+            away_score = EXCLUDED.away_score,
+            winner = EXCLUDED.winner,
+            last_updated = CURRENT_TIMESTAMP`,
+          [
+            m.id, homeTeam, awayTeam, startTime, status,
+            homeScore, awayScore, winner,
+            m.competition?.code || 'INTL',
+            m.competition?.name || 'International',
+            season, m.matchday
+          ]
+        );
+        stored++;
+      } catch (e) {
+        console.error(`❌ Error storing match ${m.id}:`, e.message);
+      }
+    }
+    
+    // Update cache metadata
+    await query(
+      `INSERT INTO cache_metadata (key, last_fetched, data_hash)
+       VALUES ('matches', NOW(), $1)
+       ON CONFLICT (key) DO UPDATE SET
+        last_fetched = NOW(),
+        data_hash = EXCLUDED.data_hash`,
+      [String(matches.length)]
+    );
+    
+    console.log(`✅ Cached ${stored} matches in DB (source: ${source})`);
+    return stored;
+    
+  } catch (err) {
+    console.error("❌ API fetch failed:", err.message);
+    return 0;
+  }
+}
+
+// ─── AI Agent ───────────────────────────────────────────────────────────
 const aiAgent = new AIMatchAgent({
   geminiApiKey: GEMINI_API_KEY
 });
 console.log("✅ AI Agent ready (uses Google Search)");
 
-// ─── Helper: Format match for frontend ─────────────────────────────────
+// ─── Format match for frontend ─────────────────────────────────────────
 function formatMatch(row) {
-  // Mock pools/odds for demo (as you wanted)
+  // Mock pools/odds for demo
   const homePool = Math.floor(Math.random() * 100) + 50;
   const drawPool = Math.floor(Math.random() * 50) + 20;
   const awayPool = Math.floor(Math.random() * 80) + 40;
@@ -100,10 +248,7 @@ function formatMatch(row) {
       code: row.competition_code,
       name: row.competition_name
     },
-    score: { 
-      home: row.home_score, 
-      away: row.away_score 
-    },
+    score: { home: row.home_score, away: row.away_score },
     winner: row.winner,
     // Mock data for frontend
     pools: {
@@ -130,42 +275,38 @@ app.get("/", (req, res) => {
   res.json({
     name: "World Cup 2026 API",
     version: "1.0.0",
-    status: "running",
-    aiAgent: "Gemini with Google Search",
+    description: "Matches cached in Neon DB | AI uses Google Search",
     endpoints: {
-      matches: "GET /api/matches",
+      matches: "GET /api/matches (from DB cache)",
       match: "GET /api/matches/:id",
+      refresh: "POST /api/refresh (fetch fresh from API)",
       analyze: "GET /api/analyze?home=Brazil&away=Argentina",
       ai: {
         gemini: "GET /api/ai/gemini/:matchId",
         predict: "GET /api/ai/predict?home=X&away=Y"
       },
+      stats: "GET /api/stats",
       leaderboard: "GET /api/leaderboard",
       ultimate: "GET /api/ultimate",
-      stats: "GET /api/stats",
-      health: "GET /api/health"
+      cache: "GET /api/cache/info"
     }
   });
 });
 
 // Health check
 app.get("/api/health", async (req, res) => {
-  try {
-    const count = await query("SELECT COUNT(*) FROM matches");
-    res.json({
-      status: "ok",
-      matchesInDB: parseInt(count.rows[0].count),
-      aiAgent: "active",
-      timestamp: new Date().toISOString()
-    });
-  } catch (err) {
-    res.json({ status: "ok", matchesInDB: 0 });
-  }
+  const count = await query("SELECT COUNT(*) FROM matches");
+  res.json({
+    status: "ok",
+    matchesInDB: parseInt(count.rows[0].count),
+    aiAgent: "active",
+    timestamp: new Date().toISOString()
+  });
 });
 
-// ─── MATCHES (from your Neon DB) ───────────────────────────────────────
+// ─── MATCHES (served from DB cache) ────────────────────────────────────
 
-// GET /api/matches - All matches
+// GET /api/matches - Get all cached matches
 app.get("/api/matches", async (req, res) => {
   try {
     const result = await query("SELECT * FROM matches ORDER BY start_time ASC");
@@ -174,14 +315,15 @@ app.get("/api/matches", async (req, res) => {
     res.json({ 
       matches,
       total: matches.length,
-      source: "Your Neon Database"
+      source: "Database cache",
+      cacheDate: new Date().toISOString()
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/matches/:id - Single match
+// GET /api/matches/:id - Get specific match
 app.get("/api/matches/:id", async (req, res) => {
   try {
     const result = await query("SELECT * FROM matches WHERE id = $1", [req.params.id]);
@@ -194,7 +336,7 @@ app.get("/api/matches/:id", async (req, res) => {
   }
 });
 
-// ─── AI ENDPOINTS (agent does its own Google search) ───────────────────
+// ─── AI ENDPOINTS ──────────────────────────────────────────────────────
 
 // GET /api/analyze - Analyze any two teams (agent searches Google)
 app.get("/api/analyze", async (req, res) => {
@@ -213,41 +355,16 @@ app.get("/api/analyze", async (req, res) => {
       competition: competition || "FIFA World Cup 2026"
     });
 
-    res.json({
-      ...analysis,
-      timestamp: new Date().toISOString()
-    });
+    res.json(analysis);
   } catch (err) {
     console.error("❌ Analysis error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/ai/predict - Alias for /analyze
-app.get("/api/ai/predict", async (req, res) => {
-  const { home, away, competition } = req.query;
-  
-  if (!home || !away) {
-    return res.status(400).json({ 
-      error: "Please provide home and away team names" 
-    });
-  }
-
-  try {
-    const analysis = await aiAgent.predict(home, away, {
-      competition: competition || "FIFA World Cup 2026"
-    });
-
-    res.json(analysis);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// GET /api/ai/gemini/:matchId - Analyze a specific match from DB
+// GET /api/ai/gemini/:matchId - Analyze match from DB
 app.get("/api/ai/gemini/:matchId", async (req, res) => {
   try {
-    // Get match from DB
     const match = await query("SELECT * FROM matches WHERE id = $1", [req.params.matchId]);
     
     if (match.rows.length === 0) {
@@ -256,7 +373,6 @@ app.get("/api/ai/gemini/:matchId", async (req, res) => {
     
     const m = match.rows[0];
     
-    // Let agent research these teams
     const analysis = await aiAgent.predict(m.home_team, m.away_team, {
       competition: m.competition_name || "FIFA World Cup 2026"
     });
@@ -271,32 +387,68 @@ app.get("/api/ai/gemini/:matchId", async (req, res) => {
   }
 });
 
+// GET /api/ai/predict - Alias for analyze
+app.get("/api/ai/predict", async (req, res) => {
+  const { home, away, competition } = req.query;
+  
+  if (!home || !away) {
+    return res.status(400).json({ error: "Please provide home and away" });
+  }
+
+  const analysis = await aiAgent.predict(home, away, {
+    competition: competition || "FIFA World Cup 2026"
+  });
+  
+  res.json(analysis);
+});
+
+// ─── REFRESH ENDPOINT - Fetch fresh from API and update cache ──────────
+app.post("/api/refresh", async (req, res) => {
+  try {
+    const stored = await fetchAndCacheMatches();
+    const total = await query("SELECT COUNT(*) FROM matches");
+    const cacheInfo = await query("SELECT * FROM cache_metadata WHERE key = 'matches'");
+    
+    res.json({
+      success: true,
+      newMatches: stored,
+      totalMatches: parseInt(total.rows[0].count),
+      lastUpdated: cacheInfo.rows[0]?.last_fetched || null,
+      message: stored > 0 ? `Cached ${stored} new matches` : "No new matches"
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── CACHE INFO ────────────────────────────────────────────────────────
+app.get("/api/cache/info", async (req, res) => {
+  const cacheInfo = await query("SELECT * FROM cache_metadata WHERE key = 'matches'");
+  const matchCount = await query("SELECT COUNT(*) FROM matches");
+  
+  res.json({
+    cacheExists: cacheInfo.rows.length > 0,
+    lastFetched: cacheInfo.rows[0]?.last_fetched || null,
+    matchesInDB: parseInt(matchCount.rows[0].count),
+    note: "Matches are served from DB cache. Use POST /api/refresh to update."
+  });
+});
+
 // ─── MOCK ENDPOINTS (for frontend) ─────────────────────────────────────
 
 // GET /api/stats
 app.get("/api/stats", async (req, res) => {
-  try {
-    const count = await query("SELECT COUNT(*) FROM matches");
-    
-    res.json({
-      matchCount: parseInt(count.rows[0].count),
-      liveMatches: 0,
-      finishedMatches: 0,
-      totalVolumeCLUTCH: "125000",
-      uniqueUsers: 1243,
-      totalBets: 5678,
-      note: "Real match counts from DB, mock betting data"
-    });
-  } catch (err) {
-    res.json({
-      matchCount: 0,
-      liveMatches: 0,
-      finishedMatches: 0,
-      totalVolumeCLUTCH: "125000",
-      uniqueUsers: 1243,
-      totalBets: 5678
-    });
-  }
+  const count = await query("SELECT COUNT(*) FROM matches");
+  
+  res.json({
+    matchCount: parseInt(count.rows[0].count),
+    liveMatches: 0,
+    finishedMatches: 0,
+    totalVolumeCLUTCH: "125000",
+    uniqueUsers: 1243,
+    totalBets: 5678,
+    note: "Real match counts from DB cache"
+  });
 });
 
 // GET /api/leaderboard
@@ -304,10 +456,7 @@ app.get("/api/leaderboard", (req, res) => {
   res.json({
     leaderboard: [
       { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
-      { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 },
-      { user: "0x3456...7890", total_wagered: "38000", bet_count: 31 },
-      { user: "0x4567...8901", total_wagered: "29000", bet_count: 15 },
-      { user: "0x5678...9012", total_wagered: "21000", bet_count: 12 }
+      { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 }
     ],
     note: "MOCK data for demo"
   });
@@ -322,39 +471,33 @@ app.get("/api/ultimate", (req, res) => {
     totalPool: "168000",
     teamPools: [
       { team: "Brazil", amount: "45000" },
-      { team: "Argentina", amount: "38000" },
-      { team: "France", amount: "32000" },
-      { team: "Germany", amount: "28000" },
-      { team: "England", amount: "25000" }
+      { team: "Argentina", amount: "38000" }
     ],
     note: "MOCK data for demo"
-  });
-});
-
-// ─── ADMIN: Refresh matches (if you need to update DB) ─────────────────
-app.post("/api/refresh", async (req, res) => {
-  // This is where you'd add logic to fetch matches if needed
-  // For now, just return current count
-  const count = await query("SELECT COUNT(*) FROM matches");
-  res.json({ 
-    success: true, 
-    message: "Matches endpoint working",
-    matchesInDB: parseInt(count.rows[0].count)
   });
 });
 
 // ─── Initialize and Start ──────────────────────────────────────────────
 async function start() {
   console.log("\n" + "=".repeat(60));
-  console.log("🚀 World Cup 2026 API");
+  console.log("🚀 World Cup 2026 API (Cached Mode)");
   console.log("=".repeat(60));
   
-  await initDatabase();
+  const matchCount = await initDatabase();
+  
+  // If DB is empty, fetch from API on startup
+  if (matchCount === 0) {
+    console.log("\n🔄 First run - fetching matches from API...");
+    await fetchAndCacheMatches();
+  } else {
+    console.log(`\n📊 Using ${matchCount} cached matches from DB`);
+  }
   
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
     console.log(`\n✅ Server running on port ${PORT}`);
-    console.log(`📊 Matches: from Neon DB`);
+    console.log(`📊 Matches: served from DB cache`);
+    console.log(`🔄 Refresh: POST /api/refresh to update cache`);
     console.log(`🤖 AI Agent: Gemini with Google Search`);
     console.log("=".repeat(60) + "\n");
   });
