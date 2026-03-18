@@ -25,11 +25,11 @@ app.use(express.json());
 // ─── Env ─────────────────────────────────────────────────────────────────────
 const GEMINI_API_KEY      = process.env.GEMINI_API_KEY;
 const DATABASE_URL        = process.env.DATABASE_URL;
-const BALLDONTLIE_API_KEY = process.env.BALLDONTLIE_API_KEY;
+const WC2026_API_KEY = process.env.WC2026_API_KEY;
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
 if (!DATABASE_URL)   { console.error("DATABASE_URL missing");     process.exit(1); }
-if (!BALLDONTLIE_API_KEY) console.warn("BALLDONTLIE_API_KEY missing — get free key at balldontlie.io");
+if (!WC2026_API_KEY) console.warn("WC2026_API_KEY not set — will use openfootball fallback (no live scores)");
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -82,74 +82,134 @@ async function initDatabase() {
   return count;
 }
 
-// ─── BALLDONTLIE World Cup 2026 API ──────────────────────────────────────────
-// Free tier — sign up at https://www.balldontlie.io to get a key
-// Has all 104 WC 2026 fixtures NOW, live scores once tournament starts June 11
-const BDL_BASE    = "https://api.balldontlie.io/fifa/worldcup/v1";
-const BDL_HEADERS = { "Authorization": process.env.BALLDONTLIE_API_KEY || "" };
+// ─── WC 2026 Data Sources ────────────────────────────────────────────────────
+//
+//  Primary  : wc2026api.com  — free key, all 104 fixtures + live scores
+//             Sign up at https://www.wc2026api.com  (free tier, no credit card)
+//             Set env var: WC2026_API_KEY=wc2026_your_key_here
+//
+//  Fallback : openfootball GitHub JSON — zero auth, historical WC data only
+//             Used automatically if primary API fails or key not set
 
-// BALLDONTLIE uses "scheduled","in_progress","final" — map to our status strings
+const WC2026_BASE = "https://api.wc2026api.com";
+
+// Map wc2026api status strings to our internal format
 function normalizeStatus(s) {
   const map = {
     "scheduled"   : "SCHEDULED",
-    "in_progress" : "IN_PLAY",
-    "final"       : "FINISHED",
+    "live"        : "IN_PLAY",
+    "in_play"     : "IN_PLAY",
+    "finished"    : "FINISHED",
+    "completed"   : "FINISHED",
     "postponed"   : "POSTPONED",
     "cancelled"   : "CANCELLED",
   };
   return map[s?.toLowerCase()] || "SCHEDULED";
 }
 
-async function fetchAndCacheMatches() {
-  const bdlKey = process.env.BALLDONTLIE_API_KEY;
-  if (!bdlKey) {
-    console.log("No BALLDONTLIE_API_KEY — skipping refresh");
-    console.log("Get free key at https://www.balldontlie.io");
-    return 0;
+async function fetchFromWC2026API() {
+  const key = process.env.WC2026_API_KEY;
+  if (!key) throw new Error("WC2026_API_KEY not set");
+
+  console.log("  Trying wc2026api.com...");
+  const resp = await axios.get(`${WC2026_BASE}/matches`, {
+    headers : { Authorization: `Bearer ${key}` },
+    timeout : 10000,
+  });
+
+  const matches = resp.data?.data || resp.data?.matches || resp.data || [];
+  if (!Array.isArray(matches) || matches.length === 0) {
+    throw new Error("No matches returned from wc2026api.com");
   }
-  console.log("Fetching WC 2026 matches from BALLDONTLIE...");
 
-  let allMatches = [];
-  let cursor = null;
+  console.log(`  ${matches.length} matches from wc2026api.com`);
+  return matches.map(m => ({
+    id        : m.id,
+    homeTeam  : m.home_team || m.home_team_name || "TBD",
+    awayTeam  : m.away_team || m.away_team_name || "TBD",
+    startTime : Math.floor(new Date(m.kickoff_utc || m.datetime || m.date).getTime() / 1000),
+    status    : normalizeStatus(m.status),
+    homeScore : m.home_score ?? 0,
+    awayScore : m.away_score ?? 0,
+    matchday  : m.match_number || m.matchday || null,
+    group     : m.group_name  || m.group     || null,
+    round     : m.round       || "Group Stage",
+    stadium   : m.stadium     || null,
+    city      : m.city        || null,
+  }));
+}
 
-  // Paginate through all matches
-  do {
+async function fetchFromOpenFootball() {
+  // openfootball GitHub raw JSON — no key needed, historical data
+  // WC 2026 file will be added when tournament starts; Qatar 2022 used for testing
+  console.log("  Trying openfootball GitHub (fallback)...");
+  const urls = [
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json",
+    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2022/worldcup.json",
+  ];
+
+  for (const url of urls) {
     try {
-      const url = cursor
-        ? `${BDL_BASE}/matches?per_page=50&cursor=${cursor}`
-        : `${BDL_BASE}/matches?per_page=50`;
-      const resp = await axios.get(url, { headers: BDL_HEADERS, timeout: 10000 });
-      const { data, meta } = resp.data;
-      allMatches = allMatches.concat(data || []);
-      cursor = meta?.next_cursor || null;
+      const resp = await axios.get(url, { timeout: 8000 });
+      const rounds = resp.data?.rounds || [];
+      const matches = [];
+      let matchId = 90000; // offset to avoid ID collisions with other sources
+
+      rounds.forEach(round => {
+        (round.matches || []).forEach(m => {
+          matches.push({
+            id        : m.num || matchId++,
+            homeTeam  : m.team1?.name || "TBD",
+            awayTeam  : m.team2?.name || "TBD",
+            startTime : Math.floor(new Date(`${m.date}T${m.time || "12:00"}:00Z`).getTime() / 1000),
+            status    : (m.score1 != null) ? "FINISHED" : "SCHEDULED",
+            homeScore : m.score1 ?? 0,
+            awayScore : m.score2 ?? 0,
+            matchday  : m.num || null,
+            group     : round.name || null,
+            round     : round.name || "Group Stage",
+            stadium   : m.stadium?.name || null,
+            city      : m.city || null,
+          });
+        });
+      });
+
+      if (matches.length > 0) {
+        console.log(`  ${matches.length} matches from openfootball (${url.includes("2026") ? "2026" : "2022 test data"})`);
+        return matches;
+      }
     } catch (e) {
-      console.error("BALLDONTLIE API error:", e.response?.status, e.message);
+      console.log(`  openfootball ${url.includes("2026") ? "2026" : "2022"}: ${e.message}`);
+    }
+  }
+  throw new Error("openfootball fallback also failed");
+}
+
+async function fetchAndCacheMatches() {
+  console.log("Fetching WC 2026 matches...");
+
+  let matches = [];
+
+  // Try primary source first, then fallback
+  try {
+    matches = await fetchFromWC2026API();
+  } catch (primaryErr) {
+    console.log(`  Primary failed: ${primaryErr.message}`);
+    try {
+      matches = await fetchFromOpenFootball();
+    } catch (fallbackErr) {
+      console.error("  All sources failed:", fallbackErr.message);
       return 0;
     }
-  } while (cursor);
+  }
 
-  console.log(`${allMatches.length} WC 2026 matches fetched`);
-  if (!allMatches.length) return 0;
-
-  // Normalise BALLDONTLIE format → our DB schema
-  const matches = allMatches.map(m => ({
-    id         : m.id,
-    homeTeam   : m.home_team?.name || "TBD",
-    awayTeam   : m.away_team?.name || "TBD",
-    startTime  : Math.floor(new Date(m.datetime).getTime() / 1000),
-    status     : normalizeStatus(m.status),
-    homeScore  : m.home_score ?? 0,
-    awayScore  : m.away_score ?? 0,
-    matchday   : m.match_number || null,
-    stage      : m.stage?.name || null,
-    group      : m.group?.name || null,
-    stadium    : m.stadium?.name || null,
-    city       : m.stadium?.city || null,
-  }));
+  if (!matches.length) {
+    console.log("No WC matches available — DB unchanged");
+    return 0;
+  }
 
   let stored = 0;
   for (const m of matches) {
-    // m is already normalised from BALLDONTLIE format above
     const winner = m.status === "FINISHED" && m.homeScore !== m.awayScore
       ? (m.homeScore > m.awayScore ? m.homeTeam : m.awayTeam) : null;
 
