@@ -31,19 +31,42 @@ if (!FOOTBALL_API_KEY) {
   console.warn("⚠️ FOOTBALL_API_KEY missing — cannot fetch matches");
 }
 
-// ─── PostgreSQL ───────────────────────────────────────────────────────────────
+// ─── PostgreSQL with proper SSL ───────────────────────────────────────────────
 const pool = new Pool({ 
   connectionString: DATABASE_URL, 
-  ssl: { rejectUnauthorized: false } 
+  ssl: { 
+    rejectUnauthorized: true,
+    sslmode: 'require'
+  },
+  connectionTimeoutMillis: 10000,
+  idleTimeoutMillis: 30000,
+  max: 20
 });
 
-pool.connect((err, client, release) => {
-  if (err) console.error("❌ DB connect error:", err.stack);
-  else { 
-    console.log("✅ Connected to Neon PostgreSQL"); 
-    release(); 
-  }
+pool.on('error', (err) => {
+  console.error('❌ Unexpected pool error:', err);
 });
+
+async function testConnection() {
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      const client = await pool.connect();
+      console.log("✅ Connected to Neon PostgreSQL");
+      client.release();
+      return true;
+    } catch (err) {
+      retries--;
+      console.log(`⚠️ Connection attempt failed (${retries} retries left):`, err.message);
+      if (retries === 0) {
+        console.error("❌ Failed to connect to database after 3 attempts");
+        return false;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }
+  return false;
+}
 
 const query = async (text, params) => {
   try { 
@@ -57,51 +80,63 @@ const query = async (text, params) => {
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
 async function initDatabase() {
-  // Main matches table (only World Cup matches)
-  await query(`
-    CREATE TABLE IF NOT EXISTS matches (
-      id               INTEGER   PRIMARY KEY,
-      home_team        TEXT      NOT NULL,
-      away_team        TEXT      NOT NULL,
-      start_time       BIGINT    NOT NULL,
-      status           TEXT      DEFAULT 'SCHEDULED',
-      home_score       INTEGER   DEFAULT 0,
-      away_score       INTEGER   DEFAULT 0,
-      winner           TEXT,
-      competition_code TEXT,
-      competition_name TEXT,
-      stage            TEXT,
-      group_name       TEXT,
-      matchday         INTEGER,
-      last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
+  try {
+    const connected = await testConnection();
+    if (!connected) {
+      console.log("⚠️ Continuing without database connection");
+      return 0;
+    }
+    
+    // Main matches table (only World Cup matches)
+    await query(`
+      CREATE TABLE IF NOT EXISTS matches (
+        id               INTEGER   PRIMARY KEY,
+        home_team        TEXT      NOT NULL,
+        away_team        TEXT      NOT NULL,
+        start_time       BIGINT    NOT NULL,
+        status           TEXT      DEFAULT 'SCHEDULED',
+        home_score       INTEGER   DEFAULT 0,
+        away_score       INTEGER   DEFAULT 0,
+        winner           TEXT,
+        competition_code TEXT,
+        competition_name TEXT,
+        stage            TEXT,
+        group_name       TEXT,
+        matchday         INTEGER,
+        last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
 
-  // Cache metadata table
-  await query(`
-    CREATE TABLE IF NOT EXISTS cache_metadata (
-      key TEXT PRIMARY KEY, 
-      last_fetched TIMESTAMP, 
-      data_hash TEXT
-    );
-  `);
+    // Cache metadata table
+    await query(`
+      CREATE TABLE IF NOT EXISTS cache_metadata (
+        key TEXT PRIMARY KEY, 
+        last_fetched TIMESTAMP, 
+        data_hash TEXT
+      );
+    `);
 
-  // AI predictions cache
-  await query(`
-    CREATE TABLE IF NOT EXISTS ai_predictions (
-      cache_key  TEXT      PRIMARY KEY,
-      prediction JSONB     NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      expires_at TIMESTAMP NOT NULL
-    );
-  `);
+    // AI predictions cache
+    await query(`
+      CREATE TABLE IF NOT EXISTS ai_predictions (
+        cache_key  TEXT      PRIMARY KEY,
+        prediction JSONB     NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL
+      );
+    `);
 
-  await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
+    await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
 
-  const count = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count);
-  console.log(`✅ DB ready — ${count} World Cup matches cached`);
-  return count;
+    const count = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count);
+    console.log(`✅ DB ready — ${count} World Cup matches cached`);
+    return count;
+    
+  } catch (err) {
+    console.error("❌ Database initialization failed:", err.message);
+    return 0;
+  }
 }
 
 // ─── Football API ─────────────────────────────────────────────────────────────
@@ -126,7 +161,6 @@ async function fetchWorldCupMatches() {
   console.log("🌍 Fetching World Cup matches from API...");
 
   try {
-    // ONLY try World Cup competition
     const resp = await axios.get(
       `${API_BASE}/competitions/WC/matches`,
       { headers: API_HEADERS, timeout: 10000 }
@@ -139,14 +173,7 @@ async function fetchWorldCupMatches() {
 
     const matches = resp.data.matches;
     console.log(`✅ Found ${matches.length} World Cup matches`);
-    
-    // Log competition info if available
-    if (resp.data.competition) {
-      console.log(`   Competition: ${resp.data.competition.name}`);
-      console.log(`   Season: ${resp.data.season?.startDate} to ${resp.data.season?.endDate}`);
-    }
 
-    // Store matches in DB
     let stored = 0;
     for (const m of matches) {
       const homeTeam  = normalizeTeam(m.homeTeam?.name || "TBD");
@@ -186,7 +213,6 @@ async function fetchWorldCupMatches() {
       }
     }
 
-    // Update cache metadata
     await query(
       `INSERT INTO cache_metadata (key, last_fetched, data_hash)
        VALUES ('worldcup', NOW(), $1)
@@ -287,7 +313,6 @@ function formatMatch(row) {
     score       : { home: row.home_score, away: row.away_score },
     winner      : row.winner,
     matchday    : row.matchday,
-    // Stable mock data (same for each match every time)
     pools       : {
       home : homePool.toString(),
       draw : drawPool.toString(),
@@ -320,6 +345,8 @@ app.get("/", (req, res) => res.json({
     refresh : "POST /api/refresh (fetch latest World Cup matches)",
     cache   : "GET  /api/cache/info",
     health  : "GET  /api/health",
+    leaderboard: "GET /api/leaderboard",
+    ultimate: "GET /api/ultimate"
   },
 }));
 
@@ -511,7 +538,8 @@ app.get("/api/ai/predict", async (req, res) => {
   }
 });
 
-// Mock endpoints for frontend
+// ─── Mock endpoints for frontend ─────────────────────────────────────────────
+
 app.get("/api/leaderboard", (req, res) => res.json({
   leaderboard: [
     { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
