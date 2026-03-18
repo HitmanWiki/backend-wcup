@@ -23,13 +23,13 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
-const FOOTBALL_API_KEY = process.env.FOOTBALL_DATA_API_KEY;
-const GEMINI_API_KEY   = process.env.GEMINI_API_KEY;
-const DATABASE_URL     = process.env.DATABASE_URL;
+const GEMINI_API_KEY      = process.env.GEMINI_API_KEY;
+const DATABASE_URL        = process.env.DATABASE_URL;
+const BALLDONTLIE_API_KEY = process.env.BALLDONTLIE_API_KEY;
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
 if (!DATABASE_URL)   { console.error("DATABASE_URL missing");     process.exit(1); }
-if (!FOOTBALL_API_KEY) console.warn("FOOTBALL_API_KEY missing — match refresh disabled, DB cache will be served");
+if (!BALLDONTLIE_API_KEY) console.warn("BALLDONTLIE_API_KEY missing — get free key at balldontlie.io");
 
 // ─── PostgreSQL ───────────────────────────────────────────────────────────────
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
@@ -82,59 +82,76 @@ async function initDatabase() {
   return count;
 }
 
-// ─── Football API ─────────────────────────────────────────────────────────────
-const API_BASE    = "https://api.football-data.org/v4";
-const API_HEADERS = { "X-Auth-Token": FOOTBALL_API_KEY };
+// ─── BALLDONTLIE World Cup 2026 API ──────────────────────────────────────────
+// Free tier — sign up at https://www.balldontlie.io to get a key
+// Has all 104 WC 2026 fixtures NOW, live scores once tournament starts June 11
+const BDL_BASE    = "https://api.balldontlie.io/fifa/worldcup/v1";
+const BDL_HEADERS = { "Authorization": process.env.BALLDONTLIE_API_KEY || "" };
 
-const TEAM_MAP = {
-  "United States" : "USA",
-  "Korea Republic": "South Korea",
-  "IR Iran"       : "Iran",
-  "Côte d'Ivoire" : "Ivory Coast",
-};
-const normalizeTeam = (n) => TEAM_MAP[n] || n;
+// BALLDONTLIE uses "scheduled","in_progress","final" — map to our status strings
+function normalizeStatus(s) {
+  const map = {
+    "scheduled"   : "SCHEDULED",
+    "in_progress" : "IN_PLAY",
+    "final"       : "FINISHED",
+    "postponed"   : "POSTPONED",
+    "cancelled"   : "CANCELLED",
+  };
+  return map[s?.toLowerCase()] || "SCHEDULED";
+}
 
 async function fetchAndCacheMatches() {
-  if (!FOOTBALL_API_KEY) {
-    console.log("No FOOTBALL_API_KEY — skipping refresh");
+  const bdlKey = process.env.BALLDONTLIE_API_KEY;
+  if (!bdlKey) {
+    console.log("No BALLDONTLIE_API_KEY — skipping refresh");
+    console.log("Get free key at https://www.balldontlie.io");
     return 0;
   }
-  console.log("Fetching World Cup 2026 matches from API...");
+  console.log("Fetching WC 2026 matches from BALLDONTLIE...");
 
-  // WC ONLY — never fall through to other leagues.
-  // WC 2026 starts June 11 2026. Before that the API returns 404 or empty.
-  let matches = [];
-  try {
-    const resp = await axios.get(
-      `${API_BASE}/competitions/WC/matches`,
-      { headers: API_HEADERS, timeout: 10000 }
-    );
-    matches = resp.data.matches || [];
-    console.log(`${matches.length} World Cup matches found`);
-  } catch (e) {
-    if (e.response?.status === 404) {
-      console.log("WC 2026 not available in API yet — tournament hasn't started");
-    } else {
-      console.error("WC API error:", e.message);
+  let allMatches = [];
+  let cursor = null;
+
+  // Paginate through all matches
+  do {
+    try {
+      const url = cursor
+        ? `${BDL_BASE}/matches?per_page=50&cursor=${cursor}`
+        : `${BDL_BASE}/matches?per_page=50`;
+      const resp = await axios.get(url, { headers: BDL_HEADERS, timeout: 10000 });
+      const { data, meta } = resp.data;
+      allMatches = allMatches.concat(data || []);
+      cursor = meta?.next_cursor || null;
+    } catch (e) {
+      console.error("BALLDONTLIE API error:", e.response?.status, e.message);
+      return 0;
     }
-    return 0;
-  }
+  } while (cursor);
 
-  if (!matches.length) {
-    console.log("No WC matches available yet — DB unchanged");
-    return 0;
-  }
+  console.log(`${allMatches.length} WC 2026 matches fetched`);
+  if (!allMatches.length) return 0;
+
+  // Normalise BALLDONTLIE format → our DB schema
+  const matches = allMatches.map(m => ({
+    id         : m.id,
+    homeTeam   : m.home_team?.name || "TBD",
+    awayTeam   : m.away_team?.name || "TBD",
+    startTime  : Math.floor(new Date(m.datetime).getTime() / 1000),
+    status     : normalizeStatus(m.status),
+    homeScore  : m.home_score ?? 0,
+    awayScore  : m.away_score ?? 0,
+    matchday   : m.match_number || null,
+    stage      : m.stage?.name || null,
+    group      : m.group?.name || null,
+    stadium    : m.stadium?.name || null,
+    city       : m.stadium?.city || null,
+  }));
 
   let stored = 0;
   for (const m of matches) {
-    const homeTeam  = normalizeTeam(m.homeTeam?.name || "TBD");
-    const awayTeam  = normalizeTeam(m.awayTeam?.name || "TBD");
-    const startTime = Math.floor(new Date(m.utcDate).getTime() / 1000);
-    const status    = m.status || "SCHEDULED";
-    const homeScore = m.score?.fullTime?.home ?? 0;
-    const awayScore = m.score?.fullTime?.away ?? 0;
-    const winner    = status === "FINISHED" && homeScore !== awayScore
-      ? (homeScore > awayScore ? homeTeam : awayTeam) : null;
+    // m is already normalised from BALLDONTLIE format above
+    const winner = m.status === "FINISHED" && m.homeScore !== m.awayScore
+      ? (m.homeScore > m.awayScore ? m.homeTeam : m.awayTeam) : null;
 
     try {
       await query(
@@ -148,9 +165,9 @@ async function fetchAndCacheMatches() {
            away_score=EXCLUDED.away_score,
            winner=EXCLUDED.winner,
            last_updated=CURRENT_TIMESTAMP`,
-        [m.id, homeTeam, awayTeam, startTime, status, homeScore, awayScore,
-         winner, m.competition?.code||"INTL", m.competition?.name||"International",
-         m.season?.startDate?.split("-")[0]||"2026", m.matchday||null]
+        [m.id, m.homeTeam, m.awayTeam, m.startTime, m.status,
+         m.homeScore, m.awayScore, winner,
+         "WC", "FIFA World Cup 2026", "2026", m.matchday]
       );
       stored++;
     } catch (e) { console.error(`Store match ${m.id}:`, e.message); }
