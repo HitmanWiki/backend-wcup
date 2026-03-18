@@ -1,18 +1,9 @@
 /**
  * AI Match Analysis Agent — Single-Call Edition
- * ─────────────────────────────────────────────
- * OLD: 6-8 Gemini API calls per prediction  → hit 20 RPD in 2 predictions
- * NEW: 1 Gemini API call per prediction     → 20 RPD = 20 full predictions
- *
+ * UPDATED: Prioritizes national teams for World Cup data
  * Architecture:
- *   Step 1 — Node.js fetches ALL data in parallel (football API + news)
- *   Step 2 — ONE Gemini call with everything pre-loaded in the prompt
- *
- * Setup:
- *   npm install @google/generative-ai axios
- *   GEMINI_API_KEY=...       https://aistudio.google.com/app/apikey
- *   FOOTBALL_API_KEY=...     https://www.football-data.org  (free tier)
- *   NEWS_API_KEY=...         https://newsapi.org            (free, optional)
+ *   Step 1 — Try database first, then API, then mock
+ *   Step 2 — ONE Gemini call with all data pre-loaded
  */
 
 "use strict";
@@ -21,7 +12,7 @@ const axios  = require("axios");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 class AIMatchAgent {
-  constructor({ footballApiKey, geminiApiKey, newsApiKey = null }) {
+  constructor({ footballApiKey, geminiApiKey, newsApiKey = null, databaseUrl = null }) {
     this.genAI          = new GoogleGenerativeAI(geminiApiKey);
     this.footballApiKey = footballApiKey;
     this.newsApiKey     = newsApiKey;
@@ -29,9 +20,32 @@ class AIMatchAgent {
     this.apiBase         = "https://api.football-data.org/v4";
     this.footballHeaders = { "X-Auth-Token": this.footballApiKey };
 
+    // Database connection (optional)
+    this.pool = null;
+    if (databaseUrl) {
+      const { Pool } = require('pg');
+      this.pool = new Pool({ 
+        connectionString: databaseUrl, 
+        ssl: { rejectUnauthorized: false } 
+      });
+      this._log("✅ AI Agent connected to database");
+    }
+
     this.teamCache   = new Map();
     this.resultCache = new Map();
     this.CACHE_TTL   = 15 * 60 * 1000; // 15 min
+
+    // List of valid World Cup teams (expand as needed)
+    this.wcTeams = new Set([
+      'Brazil', 'Argentina', 'France', 'Germany', 'Spain', 'Portugal', 'England',
+      'Netherlands', 'Belgium', 'Croatia', 'Switzerland', 'Uruguay', 'Colombia',
+      'Japan', 'South Korea', 'Morocco', 'Senegal', 'USA', 'Mexico', 'Canada',
+      'Poland', 'Denmark', 'Sweden', 'Norway', 'Wales', 'Scotland', 'Australia',
+      'Iran', 'Saudi Arabia', 'Qatar', 'Tunisia', 'Algeria', 'Nigeria', 'Ghana',
+      'Cameroon', 'Ivory Coast', 'Ecuador', 'Peru', 'Chile', 'Paraguay', 'Bolivia',
+      'Venezuela', 'Costa Rica', 'Panama', 'Jamaica', 'Honduras', 'South Africa',
+      'Egypt', 'Morocco', 'Senegal', 'Tunisia', 'Algeria', 'Nigeria'
+    ]);
 
     this.model  = "gemini-2.5-flash";
     this.config = {
@@ -52,7 +66,7 @@ class AIMatchAgent {
     this._log(`SINGLE-CALL AGENT: ${homeTeam}  vs  ${awayTeam}`);
     this._log(`${"=".repeat(60)}`);
 
-    // Step 1 — fetch all data in parallel
+    // Step 1 — fetch all data in parallel (try DB first, then API)
     this._log("\n[1/2] Fetching all data in parallel...");
     const t0 = Date.now();
 
@@ -117,7 +131,477 @@ class AIMatchAgent {
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  //  PROMPT BUILDER — all data serialised, no tool calls needed
+  //  DATABASE-FIRST IMPLEMENTATIONS
+  // ══════════════════════════════════════════════════════════════════════
+
+  async _getTeamFormFromDB(teamName, numMatches = 6) {
+    if (!this.pool) return null;
+
+    try {
+      const result = await this.pool.query(
+        `SELECT * FROM matches 
+         WHERE (home_team = $1 OR away_team = $1) 
+         AND competition_code = 'WC'
+         ORDER BY start_time DESC 
+         LIMIT $2`,
+        [teamName, numMatches]
+      );
+
+      if (result.rows.length === 0) return null;
+
+      const matches = result.rows;
+      let form = [];
+      let goalsFor = 0, goalsAgainst = 0;
+      let wins = 0, draws = 0, losses = 0;
+
+      for (const match of matches) {
+        const isHome = match.home_team === teamName;
+        const teamScore = isHome ? match.home_score : match.away_score;
+        const oppScore = isHome ? match.away_score : match.home_score;
+        
+        goalsFor += teamScore;
+        goalsAgainst += oppScore;
+
+        let result = 'D';
+        if (teamScore > oppScore) {
+          result = 'W';
+          wins++;
+        } else if (teamScore < oppScore) {
+          result = 'L';
+          losses++;
+        } else {
+          draws++;
+        }
+
+        form.push({
+          matchday: form.length + 1,
+          opponent: isHome ? match.away_team : match.home_team,
+          venue: isHome ? "H" : "A",
+          result,
+          score: `${teamScore}-${oppScore}`,
+          date: new Date(match.start_time * 1000).toISOString().split('T')[0],
+          goalDiff: teamScore - oppScore,
+        });
+      }
+
+      const n = matches.length;
+      const formString = form.map(f => f.result).join('');
+      
+      // Calculate weighted form score
+      let wPts = 0, wTotal = 0;
+      form.forEach((f, i) => {
+        const w = n - i;
+        wTotal += w * 3;
+        if (f.result === "W") wPts += w * 3;
+        else if (f.result === "D") wPts += w;
+      });
+      const formScore = wTotal > 0 ? (wPts / wTotal) * 100 : 50;
+
+      const last3 = form.slice(0, 3).map(f => f.result);
+      const momentum =
+        last3.filter(r => r === "W").length >= 2 ? "positive" :
+        last3.filter(r => r === "L").length >= 2 ? "negative" : "neutral";
+
+      return {
+        team: teamName,
+        formString,
+        formScore: +formScore.toFixed(1),
+        record: { wins, draws, losses, points: wins * 3 + draws, maxPoints: n * 3 },
+        goals: {
+          scored: goalsFor,
+          conceded: goalsAgainst,
+          avgScored: +(goalsFor / n).toFixed(2),
+          avgConceded: +(goalsAgainst / n).toFixed(2),
+          cleanSheets: form.filter(f => f.result === 'W' && parseInt(f.score.split('-')[1]) === 0).length,
+          cleanSheetRate: +((form.filter(f => f.result === 'W' && parseInt(f.score.split('-')[1]) === 0).length / n) * 100).toFixed(1),
+        },
+        momentum,
+        recentMatches: form,
+        source: 'database',
+        isMock: false,
+      };
+    } catch (err) {
+      this._log(`    DB form error: ${err.message}`);
+      return null;
+    }
+  }
+
+  async _getH2HFromDB(team1, team2) {
+    if (!this.pool) return null;
+
+    try {
+      const result = await this.pool.query(
+        `SELECT * FROM matches 
+         WHERE ((home_team = $1 AND away_team = $2) 
+            OR (home_team = $2 AND away_team = $1))
+         AND competition_code = 'WC'
+         ORDER BY start_time DESC`,
+        [team1, team2]
+      );
+
+      if (result.rows.length < 2) return null;
+
+      const matches = result.rows;
+      let team1Wins = 0, team2Wins = 0, draws = 0;
+      let team1Goals = 0, team2Goals = 0;
+
+      for (const match of matches) {
+        const isTeam1Home = match.home_team === team1;
+        const t1Score = isTeam1Home ? match.home_score : match.away_score;
+        const t2Score = isTeam1Home ? match.away_score : match.home_score;
+
+        team1Goals += t1Score;
+        team2Goals += t2Score;
+
+        if (t1Score > t2Score) team1Wins++;
+        else if (t1Score < t2Score) team2Wins++;
+        else draws++;
+      }
+
+      return {
+        teams: { team1, team2 },
+        totalMatches: matches.length,
+        record: { team1Wins, team2Wins, draws },
+        rates: {
+          team1WinRate: +((team1Wins / matches.length) * 100).toFixed(1),
+          team2WinRate: +((team2Wins / matches.length) * 100).toFixed(1),
+          drawRate: +((draws / matches.length) * 100).toFixed(1),
+        },
+        goals: { 
+          team1Total: team1Goals, 
+          team2Total: team2Goals,
+          avgPerMatch: +((team1Goals + team2Goals) / matches.length).toFixed(2),
+        },
+        dominanceScore: +((team1Wins * 3 + draws) / (matches.length * 3) * 100).toFixed(1),
+        advantage: team1Wins > team2Wins ? team1 : team2Wins > team1Wins ? team2 : "Balanced",
+        recentMeetings: matches.slice(0, 5).map(m => ({
+          date: new Date(m.start_time * 1000).toISOString().split('T')[0],
+          home: m.home_team,
+          away: m.away_team,
+          score: `${m.home_score}-${m.away_score}`,
+          winner: m.home_score > m.away_score ? m.home_team : 
+                  m.home_score < m.away_score ? m.away_team : "Draw",
+        })),
+        reliability: matches.length >= 5 ? "high" : "medium",
+        source: 'database',
+        isMock: false,
+      };
+    } catch (err) {
+      this._log(`    DB H2H error: ${err.message}`);
+      return null;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  ENHANCED TEAM ID RESOLUTION (prioritizes national teams)
+  // ══════════════════════════════════════════════════════════════════════
+
+  async _findTeamId(teamName) {
+    if (!teamName || typeof teamName !== "string") return null;
+    teamName = teamName.trim();
+    
+    // Check cache first
+    if (this.teamCache.has(teamName)) return this.teamCache.get(teamName);
+
+    // For World Cup matches, we want NATIONAL TEAMS
+    const isWCTeam = this.wcTeams.has(teamName);
+
+    // Strategy 1: Try with competition filter - get teams from WC (most reliable for national teams)
+    if (isWCTeam) {
+      try {
+        const wcResp = await axios.get(
+          `${this.apiBase}/competitions/WC/teams`,
+          { headers: this.footballHeaders, timeout: 5000 }
+        );
+        
+        const nationalTeam = wcResp.data.teams?.find(t => 
+          t.name.toLowerCase() === teamName.toLowerCase() ||
+          t.shortName?.toLowerCase() === teamName.toLowerCase() ||
+          t.tla?.toLowerCase() === teamName.toLowerCase()
+        );
+        
+        if (nationalTeam) {
+          this.teamCache.set(teamName, nationalTeam.id);
+          this._log(`    Found national team: ${teamName} (ID: ${nationalTeam.id})`);
+          return nationalTeam.id;
+        }
+      } catch (err) {
+        this._log(`    WC teams fetch failed: ${err.message}`);
+      }
+    }
+
+    // Strategy 2: Try name search with area filter (prefer national teams)
+    try {
+      const resp = await axios.get(
+        `${this.apiBase}/teams?name=${encodeURIComponent(teamName)}`,
+        { headers: this.footballHeaders, timeout: 5000 }
+      );
+      
+      if (resp.data.teams?.length > 0) {
+        // For World Cup teams, try to find the national team version
+        if (isWCTeam) {
+          const nationalTeam = resp.data.teams.find(t => 
+            t.area?.name === teamName || t.type === "NATIONAL"
+          );
+          if (nationalTeam) {
+            this.teamCache.set(teamName, nationalTeam.id);
+            return nationalTeam.id;
+          }
+        }
+        
+        // Otherwise take the first result
+        this.teamCache.set(teamName, resp.data.teams[0].id);
+        return resp.data.teams[0].id;
+      }
+    } catch { }
+
+    // Strategy 3: Full list fuzzy match
+    try {
+      const resp  = await axios.get(`${this.apiBase}/teams?limit=200`, { headers: this.footballHeaders, timeout: 8000 });
+      const lower = teamName.toLowerCase();
+      const teams = resp.data.teams || [];
+      
+      // First try to find a national team match
+      if (isWCTeam) {
+        const nationalTeam = teams.find(t => 
+          (t.area?.name?.toLowerCase() === lower || t.type === "NATIONAL") &&
+          (t.name?.toLowerCase().includes(lower) || t.shortName?.toLowerCase().includes(lower))
+        );
+        if (nationalTeam) {
+          this.teamCache.set(teamName, nationalTeam.id);
+          return nationalTeam.id;
+        }
+      }
+      
+      // Fallback to any match
+      const team = teams.find(t =>
+        t.name?.toLowerCase() === lower ||
+        t.shortName?.toLowerCase() === lower ||
+        t.tla?.toLowerCase() === lower ||
+        t.name?.toLowerCase().includes(lower) ||
+        t.shortName?.toLowerCase().includes(lower)
+      );
+      
+      if (team) {
+        this.teamCache.set(teamName, team.id);
+        return team.id;
+      }
+    } catch { }
+
+    return null;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  MODIFIED DATA FETCHERS (try DB first, then API)
+  // ══════════════════════════════════════════════════════════════════════
+
+  async _getTeamForm(teamName, numMatches = 6) {
+    const cacheKey = `form:${teamName}:${numMatches}`;
+    const cached = this._getCache(cacheKey);
+    if (cached) { 
+      this._log(`    Cache hit: form ${teamName}`); 
+      return cached; 
+    }
+
+    // Try database first
+    if (this.pool) {
+      const dbForm = await this._getTeamFormFromDB(teamName, numMatches);
+      if (dbForm) {
+        this._setCache(cacheKey, dbForm);
+        return dbForm;
+      }
+    }
+
+    // Fall back to API
+    const teamId = await this._findTeamId(teamName);
+    if (!teamId) return this._mockForm(teamName, numMatches);
+
+    try {
+      const resp = await axios.get(
+        `${this.apiBase}/teams/${teamId}/matches?limit=20&status=FINISHED`,
+        { headers: this.footballHeaders, timeout: 8000 }
+      );
+
+      const matches = (resp.data.matches || []).slice(0, numMatches);
+      if (!matches.length) return this._mockForm(teamName, numMatches);
+
+      let wins = 0, draws = 0, losses = 0, gf = 0, ga = 0, cs = 0;
+      const form = [];
+
+      matches.forEach((m, i) => {
+        const isHome   = m.homeTeam.id === teamId;
+        const scored   = isHome ? m.score.fullTime.home : m.score.fullTime.away;
+        const conceded = isHome ? m.score.fullTime.away : m.score.fullTime.home;
+        gf += scored; ga += conceded;
+        if (conceded === 0) cs++;
+        let result;
+        if      (scored > conceded) { result = "W"; wins++;   }
+        else if (scored < conceded) { result = "L"; losses++; }
+        else                        { result = "D"; draws++;  }
+        form.push({
+          matchday: i + 1,
+          opponent: isHome ? m.awayTeam.name : m.homeTeam.name,
+          venue   : isHome ? "H" : "A",
+          result, score: `${scored}-${conceded}`,
+          date    : m.utcDate.split("T")[0],
+          goalDiff: scored - conceded,
+        });
+      });
+
+      const n = matches.length;
+      const formString = form.map(f => f.result).join("");
+      let wPts = 0, wTotal = 0;
+      form.forEach((f, i) => {
+        const w = n - i;
+        wTotal += w * 3;
+        if (f.result === "W") wPts += w * 3;
+        else if (f.result === "D") wPts += w;
+      });
+      const formScore = wTotal > 0 ? (wPts / wTotal) * 100 : 50;
+      const last3 = form.slice(0, 3).map(f => f.result);
+      const momentum =
+        last3.filter(r => r === "W").length >= 2 ? "positive" :
+        last3.filter(r => r === "L").length >= 2 ? "negative" : "neutral";
+
+      const result = {
+        team: teamName, 
+        formString,
+        formScore: +formScore.toFixed(1),
+        record: { wins, draws, losses, points: wins * 3 + draws, maxPoints: n * 3 },
+        goals: {
+          scored: gf, 
+          conceded: ga,
+          avgScored: +(gf / n).toFixed(2),
+          avgConceded: +(ga / n).toFixed(2),
+          cleanSheets: cs,
+          cleanSheetRate: +((cs / n) * 100).toFixed(1),
+        },
+        momentum, 
+        recentMatches: form, 
+        source: 'api',
+        isMock: false,
+      };
+      this._setCache(cacheKey, result);
+      return result;
+    } catch (error) {
+      this._log(`    API error for ${teamName}, using mock`);
+      return this._mockForm(teamName, numMatches);
+    }
+  }
+
+  async _getHeadToHead(team1Name, team2Name) {
+    const cacheKey = `h2h:${team1Name}:${team2Name}`;
+    const cached = this._getCache(cacheKey);
+    if (cached) { 
+      this._log(`    Cache hit: h2h`); 
+      return cached; 
+    }
+
+    // Try database first
+    if (this.pool) {
+      const dbH2H = await this._getH2HFromDB(team1Name, team2Name);
+      if (dbH2H) {
+        this._setCache(cacheKey, dbH2H);
+        return dbH2H;
+      }
+    }
+
+    // Fall back to API
+    const [team1Id, team2Id] = await Promise.all([
+      this._findTeamId(team1Name),
+      this._findTeamId(team2Name),
+    ]);
+    
+    if (!team1Id || !team2Id) return this._mockH2H(team1Name, team2Name);
+
+    try {
+      const resp = await axios.get(
+        `${this.apiBase}/teams/${team1Id}/matches?limit=50&status=FINISHED`,
+        { headers: this.footballHeaders, timeout: 8000 }
+      );
+
+      const h2hMatches = (resp.data.matches || [])
+        .filter(m => m.homeTeam.id === team2Id || m.awayTeam.id === team2Id)
+        .slice(0, this.config.h2hMatchLimit);
+
+      if (h2hMatches.length < this.config.minH2HThreshold)
+        return { ...this._mockH2H(team1Name, team2Name), note: "Insufficient H2H data" };
+
+      let t1W = 0, t2W = 0, draws = 0, t1G = 0, t2G = 0, wDom = 0;
+      const recent = [];
+      const total  = h2hMatches.length;
+
+      h2hMatches.forEach((m, i) => {
+        const isT1Home = m.homeTeam.id === team1Id;
+        const t1S = isT1Home ? m.score.fullTime.home : m.score.fullTime.away;
+        const t2S = isT1Home ? m.score.fullTime.away : m.score.fullTime.home;
+        const rW  = total - i;
+        t1G += t1S; t2G += t2S;
+        if      (t1S > t2S) { t1W++; wDom += rW; }
+        else if (t1S < t2S) { t2W++; wDom -= rW; }
+        else                { draws++; }
+        if (i < 5) recent.push({
+          date  : m.utcDate.split("T")[0],
+          home  : m.homeTeam.name, 
+          away: m.awayTeam.name,
+          score : `${m.score.fullTime.home}-${m.score.fullTime.away}`,
+          winner:
+            m.score.fullTime.home > m.score.fullTime.away ? m.homeTeam.name :
+            m.score.fullTime.home < m.score.fullTime.away ? m.awayTeam.name : "Draw",
+        });
+      });
+
+      const maxW = (total * (total + 1)) / 2;
+      const dom  = 50 + (wDom / maxW) * 50;
+      const result = {
+        teams: { team1: team1Name, team2: team2Name }, 
+        totalMatches: total,
+        record: { team1Wins: t1W, team2Wins: t2W, draws },
+        rates: {
+          team1WinRate: +((t1W / total) * 100).toFixed(1),
+          team2WinRate: +((t2W / total) * 100).toFixed(1),
+          drawRate    : +((draws / total) * 100).toFixed(1),
+        },
+        goals: { 
+          team1Total: t1G, 
+          team2Total: t2G, 
+          avgPerMatch: +((t1G + t2G) / total).toFixed(2) 
+        },
+        dominanceScore: +dom.toFixed(1),
+        advantage: t1W > t2W ? team1Name : t2W > t1W ? team2Name : "Balanced",
+        recentMeetings: recent,
+        reliability: total >= 5 ? "high" : "medium",
+        source: 'api',
+        isMock: false,
+      };
+      this._setCache(cacheKey, result);
+      return result;
+    } catch (error) {
+      return this._mockH2H(team1Name, team2Name);
+    }
+  }
+
+  async _searchTeamNews(query) {
+    if (!this.newsApiKey) return { query, articles: [], note: "Set NEWS_API_KEY for live news" };
+    try {
+      const resp = await axios.get(
+        `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=publishedAt&pageSize=5&language=en&apiKey=${this.newsApiKey}`,
+        { timeout: 6000 }
+      );
+      const articles = (resp.data.articles || []).map(a => ({
+        title: a.title, 
+        source: a.source?.name,
+        publishedAt: a.publishedAt?.split("T")[0], 
+        summary: a.description,
+      }));
+      return { query, articles, count: articles.length };
+    } catch (err) {
+      return { query, articles: [], error: err.message };
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════
+  //  PROMPT BUILDER
   // ══════════════════════════════════════════════════════════════════════
 
   _buildPrompt(homeTeam, awayTeam, competition, data) {
@@ -164,7 +648,7 @@ Avg goals scored: ${homeForm.goals?.avgScored ?? "N/A"}
 Avg goals conceded: ${homeForm.goals?.avgConceded ?? "N/A"}
 Clean sheet rate: ${homeForm.goals?.cleanSheetRate ?? "N/A"}%
 Momentum        : ${homeForm.momentum ?? "N/A"}
-Data source     : ${homeForm.isMock ? "ESTIMATED (API miss)" : "Live football-data.org"}
+Data source     : ${homeForm.source || (homeForm.isMock ? "ESTIMATED (API miss)" : "Live football-data.org")}
 
 Recent matches:
 ${homeMatches}
@@ -177,7 +661,7 @@ Avg goals scored: ${awayForm.goals?.avgScored ?? "N/A"}
 Avg goals conceded: ${awayForm.goals?.avgConceded ?? "N/A"}
 Clean sheet rate: ${awayForm.goals?.cleanSheetRate ?? "N/A"}%
 Momentum        : ${awayForm.momentum ?? "N/A"}
-Data source     : ${awayForm.isMock ? "ESTIMATED (API miss)" : "Live football-data.org"}
+Data source     : ${awayForm.source || (awayForm.isMock ? "ESTIMATED (API miss)" : "Live football-data.org")}
 
 Recent matches:
 ${awayMatches}
@@ -190,7 +674,7 @@ Avg goals/match  : ${h2h.goals?.avgPerMatch ?? "N/A"}
 Dominance score  : ${h2h.dominanceScore ?? 50} / 100  (>50 favours ${homeTeam})
 Historical edge  : ${h2h.advantage ?? "Balanced"}
 Data reliability : ${h2h.reliability ?? "low"}
-Data source      : ${h2h.isMock ? "ESTIMATED (API miss)" : "Live football-data.org"}
+Data source      : ${h2h.source || (h2h.isMock ? "ESTIMATED (API miss)" : "Live football-data.org")}
 
 Recent meetings:
 ${recentH2H}
@@ -255,206 +739,25 @@ Rules:
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  //  DATA FETCHERS
-  // ══════════════════════════════════════════════════════════════════════
-
-  async _getTeamForm(teamName, numMatches = 6) {
-    const cacheKey = `form:${teamName}:${numMatches}`;
-    const cached   = this._getCache(cacheKey);
-    if (cached) { this._log(`    Cache hit: form ${teamName}`); return cached; }
-
-    const teamId = await this._findTeamId(teamName);
-    if (!teamId) return this._mockForm(teamName, numMatches);
-
-    const resp = await axios.get(
-      `${this.apiBase}/teams/${teamId}/matches?limit=20&status=FINISHED`,
-      { headers: this.footballHeaders, timeout: 8000 }
-    );
-
-    const matches = (resp.data.matches || []).slice(0, numMatches);
-    if (!matches.length) return this._mockForm(teamName, numMatches);
-
-    let wins = 0, draws = 0, losses = 0, gf = 0, ga = 0, cs = 0;
-    const form = [];
-
-    matches.forEach((m, i) => {
-      const isHome   = m.homeTeam.id === teamId;
-      const scored   = isHome ? m.score.fullTime.home : m.score.fullTime.away;
-      const conceded = isHome ? m.score.fullTime.away : m.score.fullTime.home;
-      gf += scored; ga += conceded;
-      if (conceded === 0) cs++;
-      let result;
-      if      (scored > conceded) { result = "W"; wins++;   }
-      else if (scored < conceded) { result = "L"; losses++; }
-      else                        { result = "D"; draws++;  }
-      form.push({
-        matchday: i + 1,
-        opponent: isHome ? m.awayTeam.name : m.homeTeam.name,
-        venue   : isHome ? "H" : "A",
-        result, score: `${scored}-${conceded}`,
-        date    : m.utcDate.split("T")[0],
-        goalDiff: scored - conceded,
-      });
-    });
-
-    const n = matches.length;
-    const formString = form.map(f => f.result).join("");
-    let wPts = 0, wTotal = 0;
-    form.forEach((f, i) => {
-      const w = n - i;
-      wTotal += w * 3;
-      if (f.result === "W") wPts += w * 3;
-      else if (f.result === "D") wPts += w;
-    });
-    const formScore = wTotal > 0 ? (wPts / wTotal) * 100 : 50;
-    const last3 = form.slice(0, 3).map(f => f.result);
-    const momentum =
-      last3.filter(r => r === "W").length >= 2 ? "positive" :
-      last3.filter(r => r === "L").length >= 2 ? "negative" : "neutral";
-
-    const result = {
-      team: teamName, formString,
-      formScore: +formScore.toFixed(1),
-      record: { wins, draws, losses, points: wins * 3 + draws, maxPoints: n * 3 },
-      goals: {
-        scored: gf, conceded: ga,
-        avgScored: +(gf / n).toFixed(2),
-        avgConceded: +(ga / n).toFixed(2),
-        cleanSheets: cs,
-        cleanSheetRate: +((cs / n) * 100).toFixed(1),
-      },
-      momentum, recentMatches: form, isMock: false,
-    };
-    this._setCache(cacheKey, result);
-    return result;
-  }
-
-  async _getHeadToHead(team1Name, team2Name) {
-    const cacheKey = `h2h:${team1Name}:${team2Name}`;
-    const cached   = this._getCache(cacheKey);
-    if (cached) { this._log(`    Cache hit: h2h`); return cached; }
-
-    const [team1Id, team2Id] = await Promise.all([
-      this._findTeamId(team1Name),
-      this._findTeamId(team2Name),
-    ]);
-    if (!team1Id || !team2Id) return this._mockH2H(team1Name, team2Name);
-
-    const resp = await axios.get(
-      `${this.apiBase}/teams/${team1Id}/matches?limit=50&status=FINISHED`,
-      { headers: this.footballHeaders, timeout: 8000 }
-    );
-
-    const h2hMatches = (resp.data.matches || [])
-      .filter(m => m.homeTeam.id === team2Id || m.awayTeam.id === team2Id)
-      .slice(0, this.config.h2hMatchLimit);
-
-    if (h2hMatches.length < this.config.minH2HThreshold)
-      return { ...this._mockH2H(team1Name, team2Name), note: "Insufficient H2H data" };
-
-    let t1W = 0, t2W = 0, draws = 0, t1G = 0, t2G = 0, wDom = 0;
-    const recent = [];
-    const total  = h2hMatches.length;
-
-    h2hMatches.forEach((m, i) => {
-      const isT1Home = m.homeTeam.id === team1Id;
-      const t1S = isT1Home ? m.score.fullTime.home : m.score.fullTime.away;
-      const t2S = isT1Home ? m.score.fullTime.away : m.score.fullTime.home;
-      const rW  = total - i;
-      t1G += t1S; t2G += t2S;
-      if      (t1S > t2S) { t1W++; wDom += rW; }
-      else if (t1S < t2S) { t2W++; wDom -= rW; }
-      else                { draws++; }
-      if (i < 5) recent.push({
-        date  : m.utcDate.split("T")[0],
-        home  : m.homeTeam.name, away: m.awayTeam.name,
-        score : `${m.score.fullTime.home}-${m.score.fullTime.away}`,
-        winner:
-          m.score.fullTime.home > m.score.fullTime.away ? m.homeTeam.name :
-          m.score.fullTime.home < m.score.fullTime.away ? m.awayTeam.name : "Draw",
-      });
-    });
-
-    const maxW = (total * (total + 1)) / 2;
-    const dom  = 50 + (wDom / maxW) * 50;
-    const result = {
-      teams: { team1: team1Name, team2: team2Name }, totalMatches: total,
-      record: { team1Wins: t1W, team2Wins: t2W, draws },
-      rates: {
-        team1WinRate: +((t1W / total) * 100).toFixed(1),
-        team2WinRate: +((t2W / total) * 100).toFixed(1),
-        drawRate    : +((draws / total) * 100).toFixed(1),
-      },
-      goals: { team1Total: t1G, team2Total: t2G, avgPerMatch: +((t1G + t2G) / total).toFixed(2) },
-      dominanceScore: +dom.toFixed(1),
-      advantage: t1W > t2W ? team1Name : t2W > t1W ? team2Name : "Balanced",
-      recentMeetings: recent,
-      reliability: total >= 5 ? "high" : "medium",
-      isMock: false,
-    };
-    this._setCache(cacheKey, result);
-    return result;
-  }
-
-  async _searchTeamNews(query) {
-    if (!this.newsApiKey) return { query, articles: [], note: "Set NEWS_API_KEY for live news" };
-    try {
-      const resp = await axios.get(
-        `https://newsapi.org/v2/everything?q=${encodeURIComponent(query)}&sortBy=publishedAt&pageSize=5&language=en&apiKey=${this.newsApiKey}`,
-        { timeout: 6000 }
-      );
-      const articles = (resp.data.articles || []).map(a => ({
-        title: a.title, source: a.source?.name,
-        publishedAt: a.publishedAt?.split("T")[0], summary: a.description,
-      }));
-      return { query, articles, count: articles.length };
-    } catch (err) {
-      return { query, articles: [], error: err.message };
-    }
-  }
-
-  async _findTeamId(teamName) {
-    if (!teamName || typeof teamName !== "string") return null;
-    teamName = teamName.trim();
-    if (this.teamCache.has(teamName)) return this.teamCache.get(teamName);
-
-    try {
-      const resp = await axios.get(
-        `${this.apiBase}/teams?name=${encodeURIComponent(teamName)}`,
-        { headers: this.footballHeaders, timeout: 5000 }
-      );
-      if (resp.data.teams?.length > 0) {
-        this.teamCache.set(teamName, resp.data.teams[0].id);
-        return resp.data.teams[0].id;
-      }
-    } catch { }
-
-    try {
-      const resp  = await axios.get(`${this.apiBase}/teams?limit=200`, { headers: this.footballHeaders, timeout: 8000 });
-      const lower = teamName.toLowerCase();
-      const team  = (resp.data.teams || []).find(t =>
-        t.name?.toLowerCase() === lower ||
-        t.shortName?.toLowerCase() === lower ||
-        t.tla?.toLowerCase() === lower ||
-        t.name?.toLowerCase().includes(lower) ||
-        t.shortName?.toLowerCase().includes(lower)
-      );
-      if (team) { this.teamCache.set(teamName, team.id); return team.id; }
-    } catch { }
-
-    return null;
-  }
-
-  // ══════════════════════════════════════════════════════════════════════
   //  HELPERS
   // ══════════════════════════════════════════════════════════════════════
 
   _parseOutput(text, homeTeam, awayTeam) {
     const m = text.match(/```json\s*([\s\S]+?)\s*```/) || text.match(/(\{[\s\S]+\})/);
-    if (m) { try { return JSON.parse(m[1]); } catch { } }
-    return { homeTeam, awayTeam, rawAnalysis: text,
-             prediction: { homeWin: null, draw: null, awayWin: null },
-             mostLikely: "UNKNOWN", confidence: "LOW", _parseError: true };
+    if (m) { 
+      try { 
+        return JSON.parse(m[1]); 
+      } catch { } 
+    }
+    return { 
+      homeTeam, 
+      awayTeam, 
+      rawAnalysis: text,
+      prediction: { homeWin: null, draw: null, awayWin: null },
+      mostLikely: "UNKNOWN", 
+      confidence: "LOW", 
+      _parseError: true 
+    };
   }
 
   _dataQuality({ homeForm, awayForm, h2h }) {
@@ -465,7 +768,10 @@ Rules:
   _getCache(key) {
     const e = this.resultCache.get(key);
     if (!e) return null;
-    if (Date.now() > e.expiresAt) { this.resultCache.delete(key); return null; }
+    if (Date.now() > e.expiresAt) { 
+      this.resultCache.delete(key); 
+      return null; 
+    }
     return e.data;
   }
 
@@ -473,62 +779,90 @@ Rules:
     this.resultCache.set(key, { data, expiresAt: Date.now() + this.CACHE_TTL });
   }
 
-  clearCaches() { this.teamCache.clear(); this.resultCache.clear(); this._log("Caches cleared"); }
+  clearCaches() { 
+    this.teamCache.clear(); 
+    this.resultCache.clear(); 
+    this._log("✓ Caches cleared"); 
+  }
 
   _mockForm(teamName, n) {
     const seq = ["W","W","D","L","W","D"];
     let fs = "";
     const form = [];
     for (let i = 0; i < n; i++) {
-      const r = seq[i % seq.length]; fs += r;
-      form.push({ matchday: i+1, opponent: "Unknown", venue: "H", result: r, score: "1-1", date: "N/A", goalDiff: 0 });
+      const r = seq[i % seq.length]; 
+      fs += r;
+      form.push({ 
+        matchday: i+1, 
+        opponent: "Unknown", 
+        venue: "H", 
+        result: r, 
+        score: "1-1", 
+        date: "N/A", 
+        goalDiff: 0 
+      });
     }
     const wins = (fs.match(/W/g)||[]).length, draws = (fs.match(/D/g)||[]).length;
-    return { team: teamName, formString: fs, formScore: +((wins*3+draws)/(n*3)*100).toFixed(1),
-             record: { wins, draws, losses: n-wins-draws, points: wins*3+draws },
-             goals: { avgScored: 1.4, avgConceded: 1.1, cleanSheetRate: 20 },
-             momentum: "neutral", recentMatches: form, isMock: true };
+    return { 
+      team: teamName, 
+      formString: fs, 
+      formScore: +((wins*3+draws)/(n*3)*100).toFixed(1),
+      record: { wins, draws, losses: n-wins-draws, points: wins*3+draws },
+      goals: { 
+        avgScored: 1.4, 
+        avgConceded: 1.1, 
+        cleanSheetRate: 20 
+      },
+      momentum: "neutral", 
+      recentMatches: form, 
+      source: 'mock',
+      isMock: true 
+    };
   }
 
   _mockH2H(t1, t2) {
-    return { teams: { team1: t1, team2: t2 }, totalMatches: 5,
-             record: { team1Wins: 2, team2Wins: 2, draws: 1 },
-             rates: { team1WinRate: 40, team2WinRate: 40, drawRate: 20 },
-             goals: { avgPerMatch: 2.4 }, dominanceScore: 50, advantage: "Balanced",
-             recentMeetings: [], reliability: "low", isMock: true };
+    return { 
+      teams: { team1: t1, team2: t2 }, 
+      totalMatches: 5,
+      record: { team1Wins: 2, team2Wins: 2, draws: 1 },
+      rates: { 
+        team1WinRate: 40, 
+        team2WinRate: 40, 
+        drawRate: 20 
+      },
+      goals: { avgPerMatch: 2.4 }, 
+      dominanceScore: 50, 
+      advantage: "Balanced",
+      recentMeetings: [], 
+      reliability: "low",
+      source: 'mock', 
+      isMock: true 
+    };
   }
 
   _fallbackResult(homeTeam, awayTeam, errorMsg = "") {
-    return { homeTeam, awayTeam,
-             prediction: { homeWin: 40, draw: 25, awayWin: 35 },
-             mostLikely: "HOME_WIN", confidence: "LOW",
-             bettingAngles: { recommendedBet: "No bet — prediction failed", btts: "UNCERTAIN" },
-             keyFactors: ["Prediction unavailable"], dataQuality: "LOW",
-             warningFlags: [errorMsg || "Gemini call failed"],
-             _meta: { generatedAt: new Date().toISOString(), model: this.model, fallback: true } };
+    return { 
+      homeTeam, 
+      awayTeam,
+      prediction: { homeWin: 40, draw: 25, awayWin: 35 },
+      mostLikely: "HOME_WIN", 
+      confidence: "LOW",
+      bettingAngles: { 
+        recommendedBet: "No bet — prediction failed", 
+        btts: "UNCERTAIN" 
+      },
+      keyFactors: ["Prediction unavailable"], 
+      dataQuality: "LOW",
+      warningFlags: [errorMsg || "Gemini call failed"],
+      _meta: { 
+        generatedAt: new Date().toISOString(), 
+        model: this.model, 
+        fallback: true 
+      } 
+    };
   }
 
   _log(msg) { console.log(msg); }
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  TEST — node AIMatchAgent_Gemini.js
-// ══════════════════════════════════════════════════════════════════════
-async function main() {
-  const agent = new AIMatchAgent({
-    geminiApiKey  : process.env.GEMINI_API_KEY,
-    footballApiKey: process.env.FOOTBALL_API_KEY,
-    newsApiKey    : process.env.NEWS_API_KEY || null,
-  });
-
-  const result = await agent.predict("Manchester City", "Arsenal", {
-    competition: "Premier League",
-    verbose    : false,
-  });
-
-  console.log("\n====== PREDICTION RESULT ======");
-  console.log(JSON.stringify(result, null, 2));
-}
-
-if (require.main === module) main().catch(console.error);
 module.exports = AIMatchAgent;
