@@ -99,27 +99,31 @@ async function fetchAndCacheMatches() {
     console.log("No FOOTBALL_API_KEY — skipping refresh");
     return 0;
   }
-  console.log("Fetching matches from API...");
+  console.log("Fetching World Cup 2026 matches from API...");
 
-  let matches = [], source = null;
-
-  // Try competitions in priority order
-  for (const comp of ["WC", "CL", "PL", "PD", "BL1", "SA", "FL1"]) {
-    try {
-      const resp = await axios.get(
-        `${API_BASE}/competitions/${comp}/matches?status=SCHEDULED,FINISHED,IN_PLAY`,
-        { headers: API_HEADERS, timeout: 10000 }
-      );
-      if (resp.data.matches?.length > 0) {
-        matches = resp.data.matches.slice(0, 150);
-        source  = comp;
-        console.log(`${matches.length} matches from ${comp}`);
-        break;
-      }
-    } catch (e) { console.log(`  ${comp}: ${e.response?.status || e.message}`); }
+  // WC ONLY — never fall through to other leagues.
+  // WC 2026 starts June 11 2026. Before that the API returns 404 or empty.
+  let matches = [];
+  try {
+    const resp = await axios.get(
+      `${API_BASE}/competitions/WC/matches`,
+      { headers: API_HEADERS, timeout: 10000 }
+    );
+    matches = resp.data.matches || [];
+    console.log(`${matches.length} World Cup matches found`);
+  } catch (e) {
+    if (e.response?.status === 404) {
+      console.log("WC 2026 not available in API yet — tournament hasn't started");
+    } else {
+      console.error("WC API error:", e.message);
+    }
+    return 0;
   }
 
-  if (!matches.length) { console.log("No matches from any API source"); return 0; }
+  if (!matches.length) {
+    console.log("No WC matches available yet — DB unchanged");
+    return 0;
+  }
 
   let stored = 0;
   for (const m of matches) {
@@ -158,7 +162,7 @@ async function fetchAndCacheMatches() {
      ON CONFLICT (key) DO UPDATE SET last_fetched=NOW(), data_hash=EXCLUDED.data_hash`,
     [String(stored)]
   );
-  console.log(`Stored/updated ${stored} matches (source: ${source})`);
+  console.log(`Stored/updated ${stored} WC matches`);
   return stored;
 }
 
@@ -272,14 +276,24 @@ app.get("/api/health", async (req, res) => {
 // Matches — served from DB
 app.get("/api/matches", async (req, res) => {
   try {
-    const { status, competition } = req.query;
-    let sql = "SELECT * FROM matches", vals = [];
-    const clauses = [];
-    if (status)      { clauses.push(`status=$${vals.length+1}`);            vals.push(status); }
-    if (competition) { clauses.push(`competition_code=$${vals.length+1}`);  vals.push(competition); }
-    if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
+    const { status } = req.query;
+    let sql = "SELECT * FROM matches WHERE competition_code = 'WC'";
+    const vals = [];
+    if (status) { sql += ` AND status=$1`; vals.push(status); }
     sql += " ORDER BY start_time ASC";
     const r = await query(sql, vals);
+
+    // Be honest if WC hasn't started yet
+    if (r.rows.length === 0) {
+      return res.json({
+        matches      : [],
+        total        : 0,
+        wcStatus     : "not_started",
+        message      : "FIFA World Cup 2026 matches not available yet. Tournament starts June 11, 2026.",
+        refreshUrl   : "POST /api/refresh to check for new data",
+      });
+    }
+
     res.json({ matches: r.rows.map(formatMatch), total: r.rows.length });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
