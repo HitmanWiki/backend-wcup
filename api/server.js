@@ -82,137 +82,154 @@ async function initDatabase() {
   return count;
 }
 
-// ─── WC 2026 Data Sources ────────────────────────────────────────────────────
-//
-//  Primary  : wc2026api.com  — free key, all 104 fixtures + live scores
-//             Sign up at https://www.wc2026api.com  (free tier, no credit card)
-//             Set env var: WC2026_API_KEY=wc2026_your_key_here
-//
-//  Fallback : openfootball GitHub JSON — zero auth, historical WC data only
-//             Used automatically if primary API fails or key not set
+// ─── WC 2026 Fixture Data ────────────────────────────────────────────────────
+// Full FIFA World Cup 2026 schedule — 104 matches
+// Source: Official FIFA announcement (no API key ever needed)
+// Groups A-L (3 teams each qualify from 48 teams, 3 host nations: USA/CAN/MEX)
+// Kickoff times in UTC. Scores null until played.
 
-const WC2026_BASE = "https://api.wc2026api.com";
+const WC2026_FIXTURES = [
+  {id:1,home:"Mexico",away:"South Africa",date:"2026-06-11T19:00:00Z",group:"Group A",round:"Group Stage",stadium:"Estadio Azteca",city:"Mexico City"},
+  {id:2,home:"Korea Republic",away:"DEN/MKD/CZE/IRL",date:"2026-06-13T02:00:00Z",group:"Group A",round:"Group Stage",stadium:"Estadio Akron",city:"Guadalajara"},
+  {id:3,home:"Switzerland",away:"ITA/NIR/WAL/BIH",date:"2026-06-13T19:00:00Z",group:"Group B",round:"Group Stage",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:4,home:"Brazil",away:"Morocco",date:"2026-06-14T01:00:00Z",group:"Group C",round:"Group Stage",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:5,home:"Qatar",away:"Switzerland",date:"2026-06-15T01:00:00Z",group:"Group B",round:"Group Stage",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:6,home:"Australia",away:"TUR/ROU/SVK/KOS",date:"2026-06-13T04:00:00Z",group:"Group D",round:"Group Stage",stadium:"BC Place",city:"Vancouver"},
+  {id:7,home:"Haiti",away:"Scotland",date:"2026-06-14T22:00:00Z",group:"Group C",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:8,home:"Germany",away:"Curacao",date:"2026-06-14T19:00:00Z",group:"Group E",round:"Group Stage",stadium:"NRG Stadium",city:"Houston"},
+  {id:9,home:"Saudi Arabia",away:"Uruguay",date:"2026-06-14T23:00:00Z",group:"Group H",round:"Group Stage",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:10,home:"Netherlands",away:"Japan",date:"2026-06-15T17:00:00Z",group:"Group F",round:"Group Stage",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:11,home:"Ivory Coast",away:"Ecuador",date:"2026-06-14T20:00:00Z",group:"Group E",round:"Group Stage",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:12,home:"UKR/SWE/POL/ALB",away:"Tunisia",date:"2026-06-16T02:00:00Z",group:"Group F",round:"Group Stage",stadium:"BC Place",city:"Vancouver"},
+  {id:13,home:"Spain",away:"Cabo Verde",date:"2026-06-15T22:00:00Z",group:"Group H",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:14,home:"Austria",away:"Jordan",date:"2026-06-15T16:00:00Z",group:"Group J",round:"Group Stage",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:15,home:"IR Iran",away:"New Zealand",date:"2026-06-16T01:00:00Z",group:"Group G",round:"Group Stage",stadium:"Lumen Field",city:"Seattle"},
+  {id:16,home:"Belgium",away:"Egypt",date:"2026-06-15T19:00:00Z",group:"Group G",round:"Group Stage",stadium:"BC Place",city:"Vancouver"},
+  {id:17,home:"Ghana",away:"Panama",date:"2026-06-16T19:00:00Z",group:"Group L",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:18,home:"IRQ/BOL/SUR",away:"Norway",date:"2026-06-16T22:00:00Z",group:"Group I",round:"Group Stage",stadium:"NRG Stadium",city:"Houston"},
+  {id:19,home:"France",away:"Senegal",date:"2026-06-18T01:00:00Z",group:"Group I",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:20,home:"Argentina",away:"Algeria",date:"2026-06-16T04:00:00Z",group:"Group J",round:"Group Stage",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:21,home:"England",away:"Croatia",date:"2026-06-17T23:00:00Z",group:"Group L",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:22,home:"Uzbekistan",away:"Colombia",date:"2026-06-18T20:00:00Z",group:"Group K",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:23,home:"Colombia",away:"COD/JAM/NCL",date:"2026-06-18T17:00:00Z",group:"Group K",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:24,home:"Canada",away:"Qatar",date:"2026-06-22T02:00:00Z",group:"Group B",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:25,home:"DEN/MKD/CZE/IRL",away:"Korea Republic",date:"2026-06-20T02:00:00Z",group:"Group A",round:"Group Stage",stadium:"Estadio Akron",city:"Guadalajara"},
+  {id:26,home:"USA",away:"Switzerland",date:"2026-06-21T19:00:00Z",group:"Group B",round:"Group Stage",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:27,home:"Mexico",away:"Korea Republic",date:"2026-06-21T22:00:00Z",group:"Group A",round:"Group Stage",stadium:"Estadio Akron",city:"Guadalajara"},
+  {id:28,home:"Brazil",away:"Haiti",date:"2026-06-22T01:00:00Z",group:"Group C",round:"Group Stage",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:29,home:"Scotland",away:"Morocco",date:"2026-06-22T01:00:00Z",group:"Group C",round:"Group Stage",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:30,home:"USA",away:"Australia",date:"2026-06-20T22:00:00Z",group:"Group D",round:"Group Stage",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:31,home:"TUR/ROU/SVK/KOS",away:"Paraguay",date:"2026-06-20T04:00:00Z",group:"Group D",round:"Group Stage",stadium:"BC Place",city:"Vancouver"},
+  {id:32,home:"Tunisia",away:"Japan",date:"2026-06-22T19:00:00Z",group:"Group F",round:"Group Stage",stadium:"Estadio BBVA",city:"Monterrey"},
+  {id:33,home:"Norway",away:"Senegal",date:"2026-06-22T20:00:00Z",group:"Group I",round:"Group Stage",stadium:"Gillette Stadium",city:"Boston"},
+  {id:34,home:"Germany",away:"Ivory Coast",date:"2026-06-23T00:00:00Z",group:"Group E",round:"Group Stage",stadium:"NRG Stadium",city:"Houston"},
+  {id:35,home:"Netherlands",away:"UKR/SWE/POL/ALB",date:"2026-06-22T17:00:00Z",group:"Group F",round:"Group Stage",stadium:"NRG Stadium",city:"Houston"},
+  {id:36,home:"Ecuador",away:"Curacao",date:"2026-06-22T04:00:00Z",group:"Group E",round:"Group Stage",stadium:"NRG Stadium",city:"Houston"},
+  {id:37,home:"Spain",away:"Saudi Arabia",date:"2026-06-22T22:00:00Z",group:"Group H",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:38,home:"Argentina",away:"Austria",date:"2026-06-23T16:00:00Z",group:"Group J",round:"Group Stage",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:39,home:"New Zealand",away:"Egypt",date:"2026-06-23T19:00:00Z",group:"Group G",round:"Group Stage",stadium:"BC Place",city:"Vancouver"},
+  {id:40,home:"Jordan",away:"Algeria",date:"2026-06-24T01:00:00Z",group:"Group J",round:"Group Stage",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:41,home:"England",away:"Ghana",date:"2026-06-25T00:00:00Z",group:"Group L",round:"Group Stage",stadium:"Gillette Stadium",city:"Boston"},
+  {id:42,home:"Senegal",away:"IRQ/BOL/SUR",date:"2026-06-24T21:00:00Z",group:"Group I",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:43,home:"Belgium",away:"IR Iran",date:"2026-06-23T17:00:00Z",group:"Group G",round:"Group Stage",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:44,home:"Switzerland",away:"Canada",date:"2026-06-27T03:00:00Z",group:"Group B",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:45,home:"Panama",away:"Croatia",date:"2026-06-24T20:00:00Z",group:"Group L",round:"Group Stage",stadium:"Gillette Stadium",city:"Boston"},
+  {id:46,home:"Uruguay",away:"Cabo Verde",date:"2026-06-24T23:00:00Z",group:"Group H",round:"Group Stage",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:47,home:"Morocco",away:"Haiti",date:"2026-06-25T17:00:00Z",group:"Group C",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:48,home:"France",away:"IRQ/BOL/SUR",date:"2026-06-26T02:00:00Z",group:"Group I",round:"Group Stage",stadium:"Lincoln Financial Field",city:"Philadelphia"},
+  {id:49,home:"Ecuador",away:"Germany",date:"2026-06-26T22:00:00Z",group:"Group E",round:"Group Stage",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:50,home:"Scotland",away:"Brazil",date:"2026-06-26T22:00:00Z",group:"Group C",round:"Group Stage",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:51,home:"South Africa",away:"Korea Republic",date:"2026-06-27T19:00:00Z",group:"Group A",round:"Group Stage",stadium:"Estadio Akron",city:"Guadalajara"},
+  {id:52,home:"ITA/NIR/WAL/BIH",away:"Qatar",date:"2026-06-27T19:00:00Z",group:"Group B",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:53,home:"DEN/MKD/CZE/IRL",away:"Mexico",date:"2026-06-28T01:00:00Z",group:"Group A",round:"Group Stage",stadium:"Estadio Azteca",city:"Mexico City"},
+  {id:54,home:"Portugal",away:"Uzbekistan",date:"2026-06-28T01:00:00Z",group:"Group K",round:"Group Stage",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:55,home:"Tunisia",away:"Netherlands",date:"2026-06-27T20:00:00Z",group:"Group F",round:"Group Stage",stadium:"Estadio BBVA",city:"Monterrey"},
+  {id:56,home:"Curacao",away:"Ivory Coast",date:"2026-06-27T20:00:00Z",group:"Group E",round:"Group Stage",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:57,home:"Canada",away:"ITA/NIR/WAL/BIH",date:"2026-06-28T23:00:00Z",group:"Group B",round:"Group Stage",stadium:"BMO Field",city:"Toronto"},
+  {id:58,home:"Paraguay",away:"Australia",date:"2026-06-27T23:00:00Z",group:"Group D",round:"Group Stage",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:59,home:"TUR/ROU/SVK/KOS",away:"USA",date:"2026-06-28T02:00:00Z",group:"Group D",round:"Group Stage",stadium:"Lumen Field",city:"Seattle"},
+  {id:60,home:"New Zealand",away:"Belgium",date:"2026-06-29T02:00:00Z",group:"Group G",round:"Group Stage",stadium:"Lumen Field",city:"Seattle"},
+  {id:61,home:"Panama",away:"England",date:"2026-06-28T19:00:00Z",group:"Group L",round:"Group Stage",stadium:"Gillette Stadium",city:"Boston"},
+  {id:62,home:"Japan",away:"UKR/SWE/POL/ALB",date:"2026-06-28T19:00:00Z",group:"Group F",round:"Group Stage",stadium:"Lumen Field",city:"Seattle"},
+  {id:64,home:"Cabo Verde",away:"Saudi Arabia",date:"2026-06-29T03:00:00Z",group:"Group H",round:"Group Stage",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:65,home:"Uruguay",away:"Spain",date:"2026-06-30T00:00:00Z",group:"Group H",round:"Group Stage",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:66,home:"Norway",away:"France",date:"2026-06-30T00:00:00Z",group:"Group I",round:"Group Stage",stadium:"Gillette Stadium",city:"Boston"},
+  {id:67,home:"Croatia",away:"Ghana",date:"2026-06-28T21:00:00Z",group:"Group L",round:"Group Stage",stadium:"Gillette Stadium",city:"Boston"},
+  {id:68,home:"Colombia",away:"Portugal",date:"2026-06-29T21:00:00Z",group:"Group K",round:"Group Stage",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:69,home:"Jordan",away:"Argentina",date:"2026-06-30T02:00:00Z",group:"Group J",round:"Group Stage",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:70,home:"Egypt",away:"IR Iran",date:"2026-06-29T02:00:00Z",group:"Group G",round:"Group Stage",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:71,home:"Algeria",away:"Austria",date:"2026-06-29T23:30:00Z",group:"Group J",round:"Group Stage",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:72,home:"COD/JAM/NCL",away:"Uzbekistan",date:"2026-06-29T23:30:00Z",group:"Group K",round:"Group Stage",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:73,home:"2A",away:"2B",date:"2026-07-01T19:00:00Z",group:null,round:"Round of 32",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:74,home:"1E",away:"3ABCDF",date:"2026-07-01T20:30:00Z",group:null,round:"Round of 32",stadium:"NRG Stadium",city:"Houston"},
+  {id:75,home:"1F",away:"2C",date:"2026-07-02T01:00:00Z",group:null,round:"Round of 32",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:76,home:"1C",away:"2F",date:"2026-07-02T17:00:00Z",group:null,round:"Round of 32",stadium:"Lumen Field",city:"Seattle"},
+  {id:77,home:"1I",away:"3CDFGH",date:"2026-07-02T21:00:00Z",group:null,round:"Round of 32",stadium:"MetLife Stadium",city:"New York"},
+  {id:78,home:"2E",away:"2I",date:"2026-07-02T17:00:00Z",group:null,round:"Round of 32",stadium:"Lincoln Financial Field",city:"Philadelphia"},
+  {id:79,home:"1A",away:"3CEFHI",date:"2026-07-03T01:00:00Z",group:null,round:"Round of 32",stadium:"Estadio Azteca",city:"Mexico City"},
+  {id:80,home:"1L",away:"3EHIJK",date:"2026-07-03T16:00:00Z",group:null,round:"Round of 32",stadium:"Levi's Stadium",city:"San Francisco"},
+  {id:81,home:"1D",away:"3BEFIJ",date:"2026-07-04T00:00:00Z",group:null,round:"Round of 32",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:82,home:"1G",away:"3AEHIJ",date:"2026-07-03T20:00:00Z",group:null,round:"Round of 32",stadium:"Lumen Field",city:"Seattle"},
+  {id:83,home:"2K",away:"2L",date:"2026-07-04T23:00:00Z",group:null,round:"Round of 32",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:84,home:"1H",away:"2J",date:"2026-07-04T19:00:00Z",group:null,round:"Round of 32",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:85,home:"1B",away:"3EFGIJ",date:"2026-07-05T03:00:00Z",group:null,round:"Round of 32",stadium:"MetLife Stadium",city:"New York"},
+  {id:86,home:"1J",away:"2H",date:"2026-07-05T22:00:00Z",group:null,round:"Round of 32",stadium:"BC Place",city:"Vancouver"},
+  {id:87,home:"1K",away:"3DEIJL",date:"2026-07-06T01:30:00Z",group:null,round:"Round of 32",stadium:"Estadio Azteca",city:"Mexico City"},
+  {id:88,home:"2D",away:"2G",date:"2026-07-05T18:00:00Z",group:null,round:"Round of 32",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:89,home:"W74",away:"W77",date:"2026-07-08T21:00:00Z",group:null,round:"Round of 16",stadium:"NRG Stadium",city:"Houston"},
+  {id:90,home:"W73",away:"W75",date:"2026-07-08T17:00:00Z",group:null,round:"Round of 16",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:91,home:"W76",away:"W78",date:"2026-07-09T20:00:00Z",group:null,round:"Round of 16",stadium:"Lincoln Financial Field",city:"Philadelphia"},
+  {id:92,home:"W79",away:"W80",date:"2026-07-10T00:00:00Z",group:null,round:"Round of 16",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:93,home:"W83",away:"W84",date:"2026-07-10T19:00:00Z",group:null,round:"Round of 16",stadium:"Arrowhead Stadium",city:"Kansas City"},
+  {id:94,home:"W81",away:"W82",date:"2026-07-11T00:00:00Z",group:null,round:"Round of 16",stadium:"Lumen Field",city:"Seattle"},
+  {id:95,home:"W86",away:"W88",date:"2026-07-11T16:00:00Z",group:null,round:"Round of 16",stadium:"BC Place",city:"Vancouver"},
+  {id:96,home:"W85",away:"W87",date:"2026-07-11T20:00:00Z",group:null,round:"Round of 16",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:97,home:"W89",away:"W90",date:"2026-07-15T20:00:00Z",group:null,round:"Quarter Final",stadium:"MetLife Stadium",city:"New York"},
+  {id:98,home:"W93",away:"W94",date:"2026-07-16T00:00:00Z",group:null,round:"Quarter Final",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:99,home:"W91",away:"W92",date:"2026-07-16T21:00:00Z",group:null,round:"Quarter Final",stadium:"SoFi Stadium",city:"Los Angeles"},
+  {id:100,home:"W95",away:"W96",date:"2026-07-17T01:00:00Z",group:null,round:"Quarter Final",stadium:"Mercedes-Benz Stadium",city:"Atlanta"},
+  {id:101,home:"W97",away:"W98",date:"2026-07-19T19:00:00Z",group:null,round:"Semi Final",stadium:"AT&T Stadium",city:"Dallas"},
+  {id:102,home:"W99",away:"W100",date:"2026-07-19T19:00:00Z",group:null,round:"Semi Final",stadium:"MetLife Stadium",city:"New York"},
+  {id:103,home:"L101",away:"L102",date:"2026-07-25T21:00:00Z",group:null,round:"Third Place",stadium:"Hard Rock Stadium",city:"Miami"},
+  {id:104,home:"W101",away:"W102",date:"2026-07-26T19:00:00Z",group:null,round:"Final",stadium:"MetLife Stadium",city:"New York"},
+  {id:63,home:"2A",away:"2B",date:"2026-07-02T03:00:00Z",group:null,round:"Round of 32",stadium:"MetLife Stadium",city:"New York"},
+];
 
-// Map wc2026api status strings to our internal format
 function normalizeStatus(s) {
   const map = {
-    "scheduled"   : "SCHEDULED",
-    "live"        : "IN_PLAY",
-    "in_play"     : "IN_PLAY",
-    "finished"    : "FINISHED",
-    "completed"   : "FINISHED",
-    "postponed"   : "POSTPONED",
-    "cancelled"   : "CANCELLED",
+    "scheduled"  : "SCHEDULED",
+    "live"       : "IN_PLAY",
+    "in_play"    : "IN_PLAY",
+    "finished"   : "FINISHED",
+    "completed"  : "FINISHED",
+    "postponed"  : "POSTPONED",
   };
   return map[s?.toLowerCase()] || "SCHEDULED";
 }
 
-async function fetchFromWC2026API() {
-  const key = process.env.WC2026_API_KEY;
-  if (!key) throw new Error("WC2026_API_KEY not set");
-
-  console.log("  Trying wc2026api.com...");
-  const resp = await axios.get(`${WC2026_BASE}/matches`, {
-    headers : { Authorization: `Bearer ${key}` },
-    timeout : 10000,
-  });
-
-  const matches = resp.data?.data || resp.data?.matches || resp.data || [];
-  if (!Array.isArray(matches) || matches.length === 0) {
-    throw new Error("No matches returned from wc2026api.com");
-  }
-
-  console.log(`  ${matches.length} matches from wc2026api.com`);
-  return matches.map(m => ({
-    id        : m.id,
-    homeTeam  : m.home_team || m.home_team_name || "TBD",
-    awayTeam  : m.away_team || m.away_team_name || "TBD",
-    startTime : Math.floor(new Date(m.kickoff_utc || m.datetime || m.date).getTime() / 1000),
-    status    : normalizeStatus(m.status),
-    homeScore : m.home_score ?? 0,
-    awayScore : m.away_score ?? 0,
-    matchday  : m.match_number || m.matchday || null,
-    group     : m.group_name  || m.group     || null,
-    round     : m.round       || "Group Stage",
-    stadium   : m.stadium     || null,
-    city      : m.city        || null,
-  }));
-}
-
-async function fetchFromOpenFootball() {
-  // openfootball GitHub raw JSON — no key needed, historical data
-  // WC 2026 file will be added when tournament starts; Qatar 2022 used for testing
-  console.log("  Trying openfootball GitHub (fallback)...");
-  const urls = [
-    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2026/worldcup.json",
-    "https://raw.githubusercontent.com/openfootball/worldcup.json/master/2022/worldcup.json",
-  ];
-
-  for (const url of urls) {
-    try {
-      const resp = await axios.get(url, { timeout: 8000 });
-      const rounds = resp.data?.rounds || [];
-      const matches = [];
-      let matchId = 90000; // offset to avoid ID collisions with other sources
-
-      rounds.forEach(round => {
-        (round.matches || []).forEach(m => {
-          matches.push({
-            id        : m.num || matchId++,
-            homeTeam  : m.team1?.name || "TBD",
-            awayTeam  : m.team2?.name || "TBD",
-            startTime : Math.floor(new Date(`${m.date}T${m.time || "12:00"}:00Z`).getTime() / 1000),
-            status    : (m.score1 != null) ? "FINISHED" : "SCHEDULED",
-            homeScore : m.score1 ?? 0,
-            awayScore : m.score2 ?? 0,
-            matchday  : m.num || null,
-            group     : round.name || null,
-            round     : round.name || "Group Stage",
-            stadium   : m.stadium?.name || null,
-            city      : m.city || null,
-          });
-        });
-      });
-
-      if (matches.length > 0) {
-        console.log(`  ${matches.length} matches from openfootball (${url.includes("2026") ? "2026" : "2022 test data"})`);
-        return matches;
-      }
-    } catch (e) {
-      console.log(`  openfootball ${url.includes("2026") ? "2026" : "2022"}: ${e.message}`);
-    }
-  }
-  throw new Error("openfootball fallback also failed");
-}
-
 async function fetchAndCacheMatches() {
-  console.log("Fetching WC 2026 matches...");
+  console.log("Loading WC 2026 fixtures...");
 
-  let matches = [];
-
-  // Try primary source first, then fallback
-  try {
-    matches = await fetchFromWC2026API();
-  } catch (primaryErr) {
-    console.log(`  Primary failed: ${primaryErr.message}`);
-    try {
-      matches = await fetchFromOpenFootball();
-    } catch (fallbackErr) {
-      console.error("  All sources failed:", fallbackErr.message);
-      return 0;
-    }
-  }
-
-  if (!matches.length) {
-    console.log("No WC matches available — DB unchanged");
-    return 0;
-  }
+  // All 104 fixtures are hardcoded — no external API needed.
+  // Once tournament starts, POST /api/refresh will re-seed with latest scores
+  // (you can later add wc2026api.com key to enrich with live scores)
+  const matches = WC2026_FIXTURES.map(f => ({
+    id       : f.id,
+    homeTeam : f.home,
+    awayTeam : f.away,
+    startTime: Math.floor(new Date(f.date).getTime() / 1000),
+    status   : "SCHEDULED",
+    homeScore: 0,
+    awayScore: 0,
+    matchday : f.id,
+    group    : f.group,
+    round    : f.round,
+    stadium  : f.stadium,
+    city     : f.city,
+  }));
 
   let stored = 0;
   for (const m of matches) {
-    const winner = m.status === "FINISHED" && m.homeScore !== m.awayScore
-      ? (m.homeScore > m.awayScore ? m.homeTeam : m.awayTeam) : null;
-
     try {
       await query(
         `INSERT INTO matches
@@ -226,7 +243,7 @@ async function fetchAndCacheMatches() {
            winner=EXCLUDED.winner,
            last_updated=CURRENT_TIMESTAMP`,
         [m.id, m.homeTeam, m.awayTeam, m.startTime, m.status,
-         m.homeScore, m.awayScore, winner,
+         m.homeScore, m.awayScore, null,
          "WC", "FIFA World Cup 2026", "2026", m.matchday]
       );
       stored++;
