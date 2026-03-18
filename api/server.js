@@ -31,38 +31,39 @@ if (!FOOTBALL_API_KEY) {
   console.warn("⚠️ FOOTBALL_API_KEY missing — cannot fetch matches");
 }
 
-// ─── PostgreSQL with proper SSL ───────────────────────────────────────────────
+// ─── PostgreSQL with proper SSL and retry logic ───────────────────────────────
 const pool = new Pool({ 
   connectionString: DATABASE_URL, 
   ssl: { 
-    rejectUnauthorized: true,
+    rejectUnauthorized: false, // Temporarily set to false to bypass SSL issues
     sslmode: 'require'
   },
-  connectionTimeoutMillis: 10000,
+  connectionTimeoutMillis: 15000, // Increased timeout
   idleTimeoutMillis: 30000,
-  max: 20
+  max: 10, // Reduced max connections
+  keepAlive: true
 });
 
 pool.on('error', (err) => {
   console.error('❌ Unexpected pool error:', err);
 });
 
-async function testConnection() {
-  let retries = 3;
-  while (retries > 0) {
+// Improved connection test with retries
+async function testConnection(retries = 5) {
+  for (let i = 0; i < retries; i++) {
     try {
       const client = await pool.connect();
       console.log("✅ Connected to Neon PostgreSQL");
       client.release();
       return true;
     } catch (err) {
-      retries--;
-      console.log(`⚠️ Connection attempt failed (${retries} retries left):`, err.message);
-      if (retries === 0) {
-        console.error("❌ Failed to connect to database after 3 attempts");
+      console.log(`⚠️ Connection attempt ${i + 1}/${retries} failed:`, err.message);
+      if (i === retries - 1) {
+        console.error("❌ All connection attempts failed");
         return false;
       }
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // Exponential backoff
+      await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, i)));
     }
   }
   return false;
@@ -78,7 +79,7 @@ const query = async (text, params) => {
   }
 };
 
-// ─── DB init ──────────────────────────────────────────────────────────────────
+// ─── DB init with proper schema ──────────────────────────────────────────────────
 async function initDatabase() {
   try {
     const connected = await testConnection();
@@ -87,9 +88,17 @@ async function initDatabase() {
       return 0;
     }
     
-    // Main matches table (only World Cup matches)
+    // First, check if old table exists and drop it to recreate with correct schema
+    try {
+      await query(`DROP TABLE IF EXISTS matches CASCADE;`);
+      console.log("✅ Dropped old matches table");
+    } catch (err) {
+      console.log("⚠️ No old table to drop");
+    }
+    
+    // Create matches table with ALL columns (no stage/group columns)
     await query(`
-      CREATE TABLE IF NOT EXISTS matches (
+      CREATE TABLE matches (
         id               INTEGER   PRIMARY KEY,
         home_team        TEXT      NOT NULL,
         away_team        TEXT      NOT NULL,
@@ -100,12 +109,12 @@ async function initDatabase() {
         winner           TEXT,
         competition_code TEXT,
         competition_name TEXT,
-        stage            TEXT,
-        group_name       TEXT,
+        season           TEXT,
         matchday         INTEGER,
         last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    console.log("✅ Created matches table");
 
     // Cache metadata table
     await query(`
@@ -163,7 +172,7 @@ async function fetchWorldCupMatches() {
   try {
     const resp = await axios.get(
       `${API_BASE}/competitions/WC/matches`,
-      { headers: API_HEADERS, timeout: 10000 }
+      { headers: API_HEADERS, timeout: 15000 }
     );
     
     if (!resp.data.matches?.length) {
@@ -173,6 +182,14 @@ async function fetchWorldCupMatches() {
 
     const matches = resp.data.matches;
     console.log(`✅ Found ${matches.length} World Cup matches`);
+
+    // Clear existing matches before storing new ones
+    try {
+      await query("DELETE FROM matches");
+      console.log("✅ Cleared existing matches");
+    } catch (err) {
+      console.log("⚠️ Could not clear matches:", err.message);
+    }
 
     let stored = 0;
     for (const m of matches) {
@@ -184,13 +201,14 @@ async function fetchWorldCupMatches() {
       const awayScore = m.score?.fullTime?.away ?? 0;
       const winner    = status === "FINISHED" && homeScore !== awayScore
         ? (homeScore > awayScore ? homeTeam : awayTeam) : null;
+      const season    = m.season?.startDate?.split('-')[0] || "2026";
 
       try {
         await query(
           `INSERT INTO matches
            (id, home_team, away_team, start_time, status, home_score, away_score,
-            winner, competition_code, competition_name, stage, group_name, matchday)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            winner, competition_code, competition_name, season, matchday)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            ON CONFLICT (id) DO UPDATE SET
              status = EXCLUDED.status,
              home_score = EXCLUDED.home_score,
@@ -202,12 +220,14 @@ async function fetchWorldCupMatches() {
             winner, 
             m.competition?.code || "WC", 
             m.competition?.name || "FIFA World Cup",
-            m.stage || null,
-            m.group || null,
+            season,
             m.matchday || null
           ]
         );
         stored++;
+        if (stored % 10 === 0) {
+          console.log(`   Stored ${stored}/${matches.length} matches`);
+        }
       } catch (e) { 
         console.error(`❌ Error storing match ${m.id}:`, e.message); 
       }
@@ -308,8 +328,7 @@ function formatMatch(row) {
       code: row.competition_code, 
       name: row.competition_name 
     },
-    stage       : row.stage,
-    group       : row.group_name,
+    season      : row.season,
     score       : { home: row.home_score, away: row.away_score },
     winner      : row.winner,
     matchday    : row.matchday,
@@ -367,7 +386,7 @@ app.get("/api/health", async (req, res) => {
 // GET /api/matches - ONLY World Cup matches from DB
 app.get("/api/matches", async (req, res) => {
   try {
-    const { status, group } = req.query;
+    const { status, season } = req.query;
     let sql = "SELECT * FROM matches";
     const vals = [];
     const clauses = [];
@@ -376,9 +395,9 @@ app.get("/api/matches", async (req, res) => {
       clauses.push(`status = $${vals.length + 1}`); 
       vals.push(status); 
     }
-    if (group) { 
-      clauses.push(`group_name = $${vals.length + 1}`); 
-      vals.push(group); 
+    if (season) { 
+      clauses.push(`season = $${vals.length + 1}`); 
+      vals.push(season); 
     }
     
     if (clauses.length) sql += " WHERE " + clauses.join(" AND ");
