@@ -1,6 +1,6 @@
 /**
  * World Cup 2026 Betting — Backend API
- * Separate historical matches table for international games
+ * Complete version with separate tables for World Cup and Historical matches
  */
 
 require("dotenv").config();
@@ -31,10 +31,13 @@ if (!DATABASE_URL) {
   process.exit(1);
 }
 
-// ─── Neon PostgreSQL Connection ───────────────────────────────────────────
+// ─── Neon PostgreSQL Connection with proper SSL ───────────────────────────
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { 
+    rejectUnauthorized: false,
+    sslmode: 'verify-full' // Fixed SSL warning
+  }
 });
 
 pool.connect((err, client, release) => {
@@ -58,9 +61,14 @@ const query = async (text, params) => {
   }
 };
 
-// Initialize database tables
+// Initialize database tables with correct schema
 async function initDatabase() {
-  // Table for upcoming World Cup 2026 matches
+  console.log("🔧 Initializing database tables...");
+  
+  // Drop old matches table if exists (we're migrating to new structure)
+  await query(`DROP TABLE IF EXISTS matches CASCADE;`).catch(() => {});
+  
+  // Table for World Cup 2026 matches
   await query(`
     CREATE TABLE IF NOT EXISTS worldcup_matches (
       id INTEGER PRIMARY KEY,
@@ -104,6 +112,8 @@ async function initDatabase() {
   await query(`CREATE INDEX IF NOT EXISTS idx_historical_teams ON historical_matches(home_team, away_team);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_historical_date ON historical_matches(match_date);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_historical_competition ON historical_matches(competition);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_worldcup_teams ON worldcup_matches(home_team, away_team);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_worldcup_date ON worldcup_matches(start_time);`);
   
   // Table for team mappings
   await query(`
@@ -140,7 +150,7 @@ const API_HEADERS = { "X-Auth-Token": FOOTBALL_API_KEY };
 const INTERNATIONAL_COMPETITIONS = [
   { code: 'WC', name: 'FIFA World Cup' },
   { code: 'EC', name: 'European Championship' },
-  { code: 'Copa America', name: 'Copa America' }, // Note: Different API may need different codes
+  { code: 'Copa America', name: 'Copa America' },
   { code: 'AFC', name: 'Asian Cup' },
   { code: 'CAF', name: 'Africa Cup of Nations' },
   { code: 'CONCACAF', name: 'CONCACAF Gold Cup' },
@@ -222,9 +232,45 @@ function normalizeTeam(name) {
     "Algeria": "Algeria",
     "Cameroon": "Cameroon",
     "Ghana": "Ghana",
-    "Ivory Coast": "Ivory Coast"
+    "Ivory Coast": "Ivory Coast",
+    "Cape Verde Islands": "Cape Verde",
+    "Uzbekistan": "Uzbekistan",
+    "Jordan": "Jordan",
+    "Austria": "Austria",
+    "Haiti": "Haiti",
+    "Scotland": "Scotland",
+    "Curaçao": "Curacao"
   };
   return map[name] || name;
+}
+
+// ─── Helper: Get or cache team ID ─────────────────────────────────────────
+async function getTeamId(teamName) {
+  try {
+    // Check cache first
+    const cached = await query("SELECT team_id FROM team_mappings WHERE team_name = $1", [teamName]);
+    if (cached.rows.length > 0) {
+      return cached.rows[0].team_id;
+    }
+    
+    // Fetch from API
+    const response = await axios.get(
+      `${API_BASE}/teams?name=${encodeURIComponent(teamName)}`,
+      { headers: API_HEADERS, timeout: 5000 }
+    );
+    
+    if (response.data.teams?.length > 0) {
+      const teamId = response.data.teams[0].id;
+      await query(
+        "INSERT INTO team_mappings (team_name, team_id) VALUES ($1, $2) ON CONFLICT (team_name) DO UPDATE SET team_id = $2",
+        [teamName, teamId]
+      );
+      return teamId;
+    }
+  } catch (error) {
+    console.error(`❌ Error getting team ID for ${teamName}:`, error.message);
+  }
+  return null;
 }
 
 // ─── Fetch World Cup 2026 matches ───────────────────────────────────────
@@ -259,8 +305,6 @@ async function fetchHistoricalMatches() {
     try {
       console.log(`   🔍 Fetching ${year} World Cup matches...`);
       
-      // Note: API might use different competition codes for past WCs
-      // This is an approximation - you may need to adjust based on actual API
       const response = await axios.get(
         `${API_BASE}/competitions/WC/matches?season=${year}`,
         { headers: API_HEADERS, timeout: 8000 }
@@ -311,7 +355,7 @@ async function fetchHistoricalMatches() {
     }
   }
 
-  // Fetch international friendlies and other competitions
+  // Fetch international friendlies and other competitions for major teams
   const teams = [
     'Brazil', 'Argentina', 'France', 'Germany', 'Spain', 'Portugal', 'England',
     'Netherlands', 'Belgium', 'Croatia', 'Switzerland', 'Uruguay', 'Colombia',
@@ -345,7 +389,8 @@ async function fetchHistoricalMatches() {
         if (match.competition?.type === 'CUP' || 
             match.competition?.name.includes('World Cup') ||
             match.competition?.name.includes('Friendly') ||
-            match.competition?.name.includes('International')) {
+            match.competition?.name.includes('International') ||
+            match.competition?.name.includes('Qualification')) {
           
           const matchDate = Math.floor(new Date(match.utcDate).getTime() / 1000);
           const homeTeam = normalizeTeam(match.homeTeam?.name);
@@ -367,7 +412,7 @@ async function fetchHistoricalMatches() {
                 match.id, homeTeam, awayTeam,
                 match.homeTeam?.id, match.awayTeam?.id,
                 match.competition?.name || 'International',
-                match.season?.startDate?.split('-')[0],
+                match.season?.startDate?.split('-')[0] || 'Unknown',
                 matchDate, homeScore, awayScore, winner
               ]
             );
@@ -499,7 +544,7 @@ app.get("/", (req, res) => {
     aiStatus: aiAgent ? "✅ Gemini AI Active" : "❌ Gemini AI Not Configured",
     endpoints: {
       health: "/api/health",
-      worldcup: "/api/worldcup/matches",
+      matches: "/api/matches", // World Cup 2026 matches
       historical: "/api/historical/matches",
       team: "/api/team/:name/history",
       h2h: "/api/h2h/:team1/:team2",
@@ -511,7 +556,8 @@ app.get("/", (req, res) => {
         seedHistorical: "/api/admin/seed/historical",
         seedWorldCup: "/api/admin/seed/worldcup",
         status: "/api/admin/status"
-      }
+      },
+      debug: "/api/debug/tables"
     }
   });
 });
@@ -538,8 +584,8 @@ app.get("/api/health", async (req, res) => {
 
 // ==================== WORLD CUP 2026 ENDPOINTS ====================
 
-// GET /api/worldcup/matches - All World Cup 2026 matches
-app.get("/api/worldcup/matches", async (req, res) => {
+// GET /api/matches - All World Cup 2026 matches (main endpoint for frontend)
+app.get("/api/matches", async (req, res) => {
   try {
     const result = await query("SELECT * FROM worldcup_matches ORDER BY start_time ASC");
     const matches = result.rows.map(formatWorldCupMatch);
@@ -547,14 +593,17 @@ app.get("/api/worldcup/matches", async (req, res) => {
     res.json({ 
       matches,
       total: matches.length,
-      source: "World Cup 2026 Fixtures"
+      source: "World Cup 2026 Fixtures",
+      pools: "MOCK data (for demo)",
+      odds: "MOCK data (for demo)"
     });
   } catch (error) {
+    console.error("❌ Error fetching matches:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// GET /api/worldcup/matches/:id
+// GET /api/worldcup/matches/:id - Specific World Cup match
 app.get("/api/worldcup/matches/:id", async (req, res) => {
   try {
     const result = await query("SELECT * FROM worldcup_matches WHERE id = $1", [req.params.id]);
@@ -619,7 +668,7 @@ app.get("/api/team/:name/history", async (req, res) => {
     const result = await query(
       `SELECT * FROM historical_matches 
        WHERE (home_team = $1 OR away_team = $1)
-       AND season >= (EXTRACT(YEAR FROM CURRENT_DATE) - $2)
+       AND season >= (EXTRACT(YEAR FROM CURRENT_DATE) - $2)::text
        ORDER BY match_date DESC`,
       [team, years]
     );
@@ -760,11 +809,8 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
       headToHead: h2h.rows
     };
     
-    const analysis = await aiAgent.predictWithContext(
-      match.home_team,
-      match.away_team,
-      context
-    );
+    const analysis = await aiAgent.predictWithContext
+    (match.home_team, match.away_team, context);
     
     res.json({
       matchId: match.id,
@@ -951,6 +997,7 @@ app.get("/api/admin/status", async (req, res) => {
     const recentYears = await query(`
       SELECT DISTINCT season 
       FROM historical_matches 
+      WHERE season IS NOT NULL
       ORDER BY season DESC 
       LIMIT 5
     `);
@@ -967,7 +1014,70 @@ app.get("/api/admin/status", async (req, res) => {
   }
 });
 
-// ─── Initialize Database ────────────────────────────────────────────────
+// ==================== DEBUG ENDPOINTS ====================
+
+// GET /api/debug/tables - Check database tables
+app.get("/api/debug/tables", async (req, res) => {
+  try {
+    const tables = await query(`
+      SELECT table_name 
+      FROM information_schema.tables 
+      WHERE table_schema = 'public'
+    `);
+    
+    const wcColumns = await query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'worldcup_matches'
+    `);
+    
+    const histColumns = await query(`
+      SELECT column_name 
+      FROM information_schema.columns 
+      WHERE table_name = 'historical_matches'
+    `);
+    
+    const wcCount = await query("SELECT COUNT(*) FROM worldcup_matches");
+    const histCount = await query("SELECT COUNT(*) FROM historical_matches");
+    
+    res.json({
+      tables: tables.rows,
+      worldcup_matches: {
+        columns: wcColumns.rows,
+        count: parseInt(wcCount.rows[0].count)
+      },
+      historical_matches: {
+        columns: histColumns.rows,
+        count: parseInt(histCount.rows[0].count)
+      }
+    });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
+// GET /api/debug - Legacy debug endpoint (for backward compatibility)
+app.get("/api/debug", async (req, res) => {
+  try {
+    const wc = await query("SELECT COUNT(*) FROM worldcup_matches");
+    const hist = await query("SELECT COUNT(*) FROM historical_matches");
+    const sample = await query("SELECT * FROM worldcup_matches LIMIT 1");
+    
+    res.json({
+      apiKey: FOOTBALL_API_KEY ? "✅" : "❌",
+      geminiKey: GEMINI_API_KEY ? "✅" : "❌",
+      database: "Neon PostgreSQL",
+      worldCupMatches: parseInt(wc.rows[0].count),
+      historicalMatches: parseInt(hist.rows[0].count),
+      sampleMatch: sample.rows[0] || null,
+      note: "Using new table structure: worldcup_matches and historical_matches"
+    });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
+// ─── Initialize Database and Fetch Data ────────────────────────────────
 async function initialize() {
   console.log("\n" + "=".repeat(60));
   console.log("🚀 Starting World Cup API with Historical Data");
@@ -986,7 +1096,15 @@ async function initialize() {
       const matches = await fetchWorldCupMatches();
       if (matches.length > 0) {
         await storeWorldCupMatches(matches);
+      } else {
+        console.log("⚠️ No World Cup matches available from API yet");
       }
+    }
+    
+    // Auto-fetch historical matches if none exist
+    if (counts.historical === 0) {
+      console.log("🔄 No historical matches found, you may want to seed them via admin endpoint");
+      console.log("   POST /api/admin/seed/historical with admin secret");
     }
     
     console.log("\n✅ Database ready");
