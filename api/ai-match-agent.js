@@ -1,8 +1,8 @@
 /**
  * AI Match Analysis Agent — Single-Call Edition
- * UPDATED: Prioritizes national teams for World Cup data
+ * UPDATED: Fetches from historical_matches and worldcup_matches tables
  * Architecture:
- *   Step 1 — Try database first, then API, then mock
+ *   Step 1 — Try historical database first, then API, then mock
  *   Step 2 — ONE Gemini call with all data pre-loaded
  */
 
@@ -44,7 +44,13 @@ class AIMatchAgent {
       'Iran', 'Saudi Arabia', 'Qatar', 'Tunisia', 'Algeria', 'Nigeria', 'Ghana',
       'Cameroon', 'Ivory Coast', 'Ecuador', 'Peru', 'Chile', 'Paraguay', 'Bolivia',
       'Venezuela', 'Costa Rica', 'Panama', 'Jamaica', 'Honduras', 'South Africa',
-      'Egypt', 'Morocco', 'Senegal', 'Tunisia', 'Algeria', 'Nigeria'
+      'Egypt', 'Morocco', 'Senegal', 'Tunisia', 'Algeria', 'Nigeria', 'Cape Verde Islands',
+      'Uzbekistan', 'Jordan', 'Austria', 'Haiti', 'Scotland', 'New Zealand', 'Curaçao',
+      'Croatia', 'Switzerland', 'Poland', 'Denmark', 'Sweden', 'Norway', 'Wales',
+      'Scotland', 'Australia', 'Iran', 'Saudi Arabia', 'Qatar', 'Tunisia', 'Algeria',
+      'Nigeria', 'Ghana', 'Cameroon', 'Ivory Coast', 'Ecuador', 'Peru', 'Chile',
+      'Paraguay', 'Bolivia', 'Venezuela', 'Costa Rica', 'Panama', 'Jamaica', 'Honduras',
+      'South Africa', 'Egypt', 'Morocco', 'Senegal'
     ]);
 
     this.model  = "gemini-2.5-flash";
@@ -131,23 +137,38 @@ class AIMatchAgent {
   }
 
   // ══════════════════════════════════════════════════════════════════════
-  //  DATABASE-FIRST IMPLEMENTATIONS
+  //  DATABASE-FIRST IMPLEMENTATIONS - UPDATED for historical_matches
   // ══════════════════════════════════════════════════════════════════════
 
   async _getTeamFormFromDB(teamName, numMatches = 6) {
     if (!this.pool) return null;
 
     try {
+      // Query from historical_matches table (2010-2022 international matches)
       const result = await this.pool.query(
-        `SELECT * FROM matches 
-         WHERE (home_team = $1 OR away_team = $1) 
-         AND competition_code = 'WC'
-         ORDER BY start_time DESC 
+        `SELECT * FROM historical_matches 
+         WHERE (home_team = $1 OR away_team = $1)
+         ORDER BY match_date DESC 
          LIMIT $2`,
         [teamName, numMatches]
       );
 
-      if (result.rows.length === 0) return null;
+      if (result.rows.length === 0) {
+        // If no historical matches, try worldcup_matches for any finished WC games
+        const wcResult = await this.pool.query(
+          `SELECT * FROM worldcup_matches 
+           WHERE (home_team = $1 OR away_team = $1)
+           AND status = 'FINISHED'
+           ORDER BY start_time DESC 
+           LIMIT $2`,
+          [teamName, numMatches]
+        );
+        
+        if (wcResult.rows.length === 0) return null;
+        
+        // Convert worldcup_matches format to historical format
+        return this._convertWCMatchesToForm(wcResult.rows, teamName);
+      }
 
       const matches = result.rows;
       let form = [];
@@ -179,18 +200,20 @@ class AIMatchAgent {
           venue: isHome ? "H" : "A",
           result,
           score: `${teamScore}-${oppScore}`,
-          date: new Date(match.start_time * 1000).toISOString().split('T')[0],
+          date: new Date(match.match_date * 1000).toISOString().split('T')[0],
           goalDiff: teamScore - oppScore,
+          competition: match.competition,
+          season: match.season
         });
       }
 
       const n = matches.length;
       const formString = form.map(f => f.result).join('');
       
-      // Calculate weighted form score
+      // Calculate weighted form score (more recent = higher weight)
       let wPts = 0, wTotal = 0;
       form.forEach((f, i) => {
-        const w = n - i;
+        const w = n - i; // Most recent (i=0) gets highest weight
         wTotal += w * 3;
         if (f.result === "W") wPts += w * 3;
         else if (f.result === "D") wPts += w;
@@ -202,6 +225,12 @@ class AIMatchAgent {
         last3.filter(r => r === "W").length >= 2 ? "positive" :
         last3.filter(r => r === "L").length >= 2 ? "negative" : "neutral";
 
+      // Calculate clean sheets
+      const cleanSheets = form.filter(f => {
+        const [home, away] = f.score.split('-').map(Number);
+        return f.result === 'W' && (f.venue === "H" ? away === 0 : home === 0);
+      }).length;
+
       return {
         team: teamName,
         formString,
@@ -212,12 +241,12 @@ class AIMatchAgent {
           conceded: goalsAgainst,
           avgScored: +(goalsFor / n).toFixed(2),
           avgConceded: +(goalsAgainst / n).toFixed(2),
-          cleanSheets: form.filter(f => f.result === 'W' && parseInt(f.score.split('-')[1]) === 0).length,
-          cleanSheetRate: +((form.filter(f => f.result === 'W' && parseInt(f.score.split('-')[1]) === 0).length / n) * 100).toFixed(1),
+          cleanSheets,
+          cleanSheetRate: +((cleanSheets / n) * 100).toFixed(1),
         },
         momentum,
         recentMatches: form,
-        source: 'database',
+        source: 'historical_db',
         isMock: false,
       };
     } catch (err) {
@@ -226,70 +255,250 @@ class AIMatchAgent {
     }
   }
 
+  async _convertWCMatchesToForm(matches, teamName) {
+    let form = [];
+    let goalsFor = 0, goalsAgainst = 0;
+    let wins = 0, draws = 0, losses = 0;
+
+    for (const match of matches) {
+      const isHome = match.home_team === teamName;
+      const teamScore = isHome ? match.home_score : match.away_score;
+      const oppScore = isHome ? match.away_score : match.home_score;
+      
+      goalsFor += teamScore;
+      goalsAgainst += oppScore;
+
+      let result = 'D';
+      if (teamScore > oppScore) {
+        result = 'W';
+        wins++;
+      } else if (teamScore < oppScore) {
+        result = 'L';
+        losses++;
+      } else {
+        draws++;
+      }
+
+      form.push({
+        matchday: form.length + 1,
+        opponent: isHome ? match.away_team : match.home_team,
+        venue: isHome ? "H" : "A",
+        result,
+        score: `${teamScore}-${oppScore}`,
+        date: new Date(match.start_time * 1000).toISOString().split('T')[0],
+        goalDiff: teamScore - oppScore,
+        competition: 'FIFA World Cup',
+        season: '2026'
+      });
+    }
+
+    const n = matches.length;
+    const formString = form.map(f => f.result).join('');
+    
+    let wPts = 0, wTotal = 0;
+    form.forEach((f, i) => {
+      const w = n - i;
+      wTotal += w * 3;
+      if (f.result === "W") wPts += w * 3;
+      else if (f.result === "D") wPts += w;
+    });
+    const formScore = wTotal > 0 ? (wPts / wTotal) * 100 : 50;
+
+    const last3 = form.slice(0, 3).map(f => f.result);
+    const momentum =
+      last3.filter(r => r === "W").length >= 2 ? "positive" :
+      last3.filter(r => r === "L").length >= 2 ? "negative" : "neutral";
+
+    const cleanSheets = form.filter(f => {
+      const [home, away] = f.score.split('-').map(Number);
+      return f.result === 'W' && (f.venue === "H" ? away === 0 : home === 0);
+    }).length;
+
+    return {
+      team: teamName,
+      formString,
+      formScore: +formScore.toFixed(1),
+      record: { wins, draws, losses, points: wins * 3 + draws, maxPoints: n * 3 },
+      goals: {
+        scored: goalsFor,
+        conceded: goalsAgainst,
+        avgScored: +(goalsFor / n).toFixed(2),
+        avgConceded: +(goalsAgainst / n).toFixed(2),
+        cleanSheets,
+        cleanSheetRate: +((cleanSheets / n) * 100).toFixed(1),
+      },
+      momentum,
+      recentMatches: form,
+      source: 'worldcup_db',
+      isMock: false,
+    };
+  }
+
   async _getH2HFromDB(team1, team2) {
     if (!this.pool) return null;
 
     try {
+      // Query from historical_matches table first
       const result = await this.pool.query(
-        `SELECT * FROM matches 
-         WHERE ((home_team = $1 AND away_team = $2) 
-            OR (home_team = $2 AND away_team = $1))
-         AND competition_code = 'WC'
-         ORDER BY start_time DESC`,
+        `SELECT * FROM historical_matches 
+         WHERE (home_team = $1 AND away_team = $2) 
+            OR (home_team = $2 AND away_team = $1)
+         ORDER BY match_date DESC`,
         [team1, team2]
       );
 
-      if (result.rows.length < 2) return null;
+      if (result.rows.length < 2) {
+        // Try worldcup_matches for any WC meetings
+        const wcResult = await this.pool.query(
+          `SELECT * FROM worldcup_matches 
+           WHERE ((home_team = $1 AND away_team = $2) 
+              OR (home_team = $2 AND away_team = $1))
+           AND status = 'FINISHED'
+           ORDER BY start_time DESC`,
+          [team1, team2]
+        );
+        
+        if (wcResult.rows.length === 0) return null;
+        
+        // Convert WC matches format
+        return this._convertWCMatchesToH2H(wcResult.rows, team1, team2);
+      }
 
       const matches = result.rows;
       let team1Wins = 0, team2Wins = 0, draws = 0;
       let team1Goals = 0, team2Goals = 0;
+      let weightedDom = 0;
+      const recent = [];
+      const total = matches.length;
 
-      for (const match of matches) {
+      for (let i = 0; i < matches.length; i++) {
+        const match = matches[i];
         const isTeam1Home = match.home_team === team1;
         const t1Score = isTeam1Home ? match.home_score : match.away_score;
         const t2Score = isTeam1Home ? match.away_score : match.home_score;
+        const recencyW = total - i; // More recent = higher weight
 
         team1Goals += t1Score;
         team2Goals += t2Score;
 
-        if (t1Score > t2Score) team1Wins++;
-        else if (t1Score < t2Score) team2Wins++;
-        else draws++;
+        if (t1Score > t2Score) { 
+          team1Wins++; 
+          weightedDom += recencyW;
+        } else if (t1Score < t2Score) { 
+          team2Wins++; 
+          weightedDom -= recencyW;
+        } else { 
+          draws++; 
+        }
+
+        if (i < 5) {
+          recent.push({
+            date: new Date(match.match_date * 1000).toISOString().split('T')[0],
+            home: match.home_team,
+            away: match.away_team,
+            score: `${match.home_score}-${match.away_score}`,
+            winner: match.winner || (match.home_score > match.away_score ? match.home_team :
+                    match.home_score < match.away_score ? match.away_team : "Draw"),
+            competition: match.competition,
+            season: match.season
+          });
+        }
       }
+
+      const maxWeight = (total * (total + 1)) / 2;
+      const dominanceScore = 50 + (weightedDom / maxWeight) * 50;
 
       return {
         teams: { team1, team2 },
-        totalMatches: matches.length,
+        totalMatches: total,
         record: { team1Wins, team2Wins, draws },
         rates: {
-          team1WinRate: +((team1Wins / matches.length) * 100).toFixed(1),
-          team2WinRate: +((team2Wins / matches.length) * 100).toFixed(1),
-          drawRate: +((draws / matches.length) * 100).toFixed(1),
+          team1WinRate: +((team1Wins / total) * 100).toFixed(1),
+          team2WinRate: +((team2Wins / total) * 100).toFixed(1),
+          drawRate: +((draws / total) * 100).toFixed(1),
         },
-        goals: { 
-          team1Total: team1Goals, 
+        goals: {
+          team1Total: team1Goals,
           team2Total: team2Goals,
-          avgPerMatch: +((team1Goals + team2Goals) / matches.length).toFixed(2),
+          avgPerMatch: +((team1Goals + team2Goals) / total).toFixed(2),
         },
-        dominanceScore: +((team1Wins * 3 + draws) / (matches.length * 3) * 100).toFixed(1),
+        dominanceScore: +dominanceScore.toFixed(1),
         advantage: team1Wins > team2Wins ? team1 : team2Wins > team1Wins ? team2 : "Balanced",
-        recentMeetings: matches.slice(0, 5).map(m => ({
-          date: new Date(m.start_time * 1000).toISOString().split('T')[0],
-          home: m.home_team,
-          away: m.away_team,
-          score: `${m.home_score}-${m.away_score}`,
-          winner: m.home_score > m.away_score ? m.home_team : 
-                  m.home_score < m.away_score ? m.away_team : "Draw",
-        })),
-        reliability: matches.length >= 5 ? "high" : "medium",
-        source: 'database',
+        recentMeetings: recent,
+        reliability: total >= 5 ? "high" : "medium",
+        source: 'historical_db',
         isMock: false,
       };
     } catch (err) {
       this._log(`    DB H2H error: ${err.message}`);
       return null;
     }
+  }
+
+  async _convertWCMatchesToH2H(matches, team1, team2) {
+    let team1Wins = 0, team2Wins = 0, draws = 0;
+    let team1Goals = 0, team2Goals = 0;
+    let weightedDom = 0;
+    const recent = [];
+    const total = matches.length;
+
+    for (let i = 0; i < matches.length; i++) {
+      const match = matches[i];
+      const isTeam1Home = match.home_team === team1;
+      const t1Score = isTeam1Home ? match.home_score : match.away_score;
+      const t2Score = isTeam1Home ? match.away_score : match.home_score;
+      const recencyW = total - i;
+
+      team1Goals += t1Score;
+      team2Goals += t2Score;
+
+      if (t1Score > t2Score) { 
+        team1Wins++; 
+        weightedDom += recencyW;
+      } else if (t1Score < t2Score) { 
+        team2Wins++; 
+        weightedDom -= recencyW;
+      } else { 
+        draws++; 
+      }
+
+      if (i < 5) {
+        recent.push({
+          date: new Date(match.start_time * 1000).toISOString().split('T')[0],
+          home: match.home_team,
+          away: match.away_team,
+          score: `${match.home_score}-${match.away_score}`,
+          winner: match.winner,
+          competition: 'FIFA World Cup',
+          season: '2026'
+        });
+      }
+    }
+
+    const maxWeight = (total * (total + 1)) / 2;
+    const dominanceScore = 50 + (weightedDom / maxWeight) * 50;
+
+    return {
+      teams: { team1, team2 },
+      totalMatches: total,
+      record: { team1Wins, team2Wins, draws },
+      rates: {
+        team1WinRate: +((team1Wins / total) * 100).toFixed(1),
+        team2WinRate: +((team2Wins / total) * 100).toFixed(1),
+        drawRate: +((draws / total) * 100).toFixed(1),
+      },
+      goals: {
+        team1Total: team1Goals,
+        team2Total: team2Goals,
+        avgPerMatch: +((team1Goals + team2Goals) / total).toFixed(2),
+      },
+      dominanceScore: +dominanceScore.toFixed(1),
+      advantage: team1Wins > team2Wins ? team1 : team2Wins > team1Wins ? team2 : "Balanced",
+      recentMeetings: recent,
+      reliability: total >= 5 ? "high" : "medium",
+      source: 'worldcup_db',
+      isMock: false,
+    };
   }
 
   // ══════════════════════════════════════════════════════════════════════
@@ -403,7 +612,7 @@ class AIMatchAgent {
       return cached; 
     }
 
-    // Try database first
+    // Try database first (historical_matches)
     if (this.pool) {
       const dbForm = await this._getTeamFormFromDB(teamName, numMatches);
       if (dbForm) {
@@ -497,7 +706,7 @@ class AIMatchAgent {
       return cached; 
     }
 
-    // Try database first
+    // Try database first (historical_matches)
     if (this.pool) {
       const dbH2H = await this._getH2HFromDB(team1Name, team2Name);
       if (dbH2H) {
@@ -648,7 +857,7 @@ Avg goals scored: ${homeForm.goals?.avgScored ?? "N/A"}
 Avg goals conceded: ${homeForm.goals?.avgConceded ?? "N/A"}
 Clean sheet rate: ${homeForm.goals?.cleanSheetRate ?? "N/A"}%
 Momentum        : ${homeForm.momentum ?? "N/A"}
-Data source     : ${homeForm.source || (homeForm.isMock ? "ESTIMATED (API miss)" : "Live football-data.org")}
+Data source     : ${homeForm.source || (homeForm.isMock ? "ESTIMATED (fallback)" : "Historical database")}
 
 Recent matches:
 ${homeMatches}
@@ -661,7 +870,7 @@ Avg goals scored: ${awayForm.goals?.avgScored ?? "N/A"}
 Avg goals conceded: ${awayForm.goals?.avgConceded ?? "N/A"}
 Clean sheet rate: ${awayForm.goals?.cleanSheetRate ?? "N/A"}%
 Momentum        : ${awayForm.momentum ?? "N/A"}
-Data source     : ${awayForm.source || (awayForm.isMock ? "ESTIMATED (API miss)" : "Live football-data.org")}
+Data source     : ${awayForm.source || (awayForm.isMock ? "ESTIMATED (fallback)" : "Historical database")}
 
 Recent matches:
 ${awayMatches}
@@ -674,7 +883,7 @@ Avg goals/match  : ${h2h.goals?.avgPerMatch ?? "N/A"}
 Dominance score  : ${h2h.dominanceScore ?? 50} / 100  (>50 favours ${homeTeam})
 Historical edge  : ${h2h.advantage ?? "Balanced"}
 Data reliability : ${h2h.reliability ?? "low"}
-Data source      : ${h2h.source || (h2h.isMock ? "ESTIMATED (API miss)" : "Live football-data.org")}
+Data source      : ${h2h.source || (h2h.isMock ? "ESTIMATED (fallback)" : "Historical database")}
 
 Recent meetings:
 ${recentH2H}
