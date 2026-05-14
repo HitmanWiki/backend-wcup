@@ -1,6 +1,6 @@
 /**
  * World Cup 2026 Betting — Backend API
- * Complete World Cup 2026 fixture list (104 matches)
+ * Complete World Cup 2026 fixture list (102 matches)
  */
 
 require("dotenv").config();
@@ -17,7 +17,8 @@ app.use(express.json());
 // ─── Env ─────────────────────────────────────────────────────────────────────
 const GEMINI_API_KEY      = process.env.GEMINI_API_KEY;
 const DATABASE_URL        = process.env.DATABASE_URL;
-const WC2026_API_KEY = process.env.WC2026_API_KEY;
+const FOOTBALL_DATA_KEY   = process.env.FOOTBALL_DATA_API_KEY;
+const API_FOOTBALL_KEY    = process.env.API_FOOTBALL_KEY;
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
 if (!DATABASE_URL)   { console.error("DATABASE_URL missing");     process.exit(1); }
@@ -66,6 +67,40 @@ async function initDatabase() {
   `);
   
   await query(`
+    CREATE TABLE IF NOT EXISTS bets (
+      id SERIAL PRIMARY KEY,
+      match_id INTEGER REFERENCES matches(id),
+      user_address TEXT NOT NULL,
+      prediction TEXT NOT NULL,
+      amount TEXT NOT NULL,
+      tx_hash TEXT,
+      claimed BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS ultimate_bets (
+      id SERIAL PRIMARY KEY,
+      user_address TEXT NOT NULL,
+      team TEXT NOT NULL,
+      amount TEXT NOT NULL,
+      tx_hash TEXT,
+      claimed BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
+
+  await query(`
+    CREATE TABLE IF NOT EXISTS betting_settings (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      ultimate_deadline BIGINT NOT NULL DEFAULT 0,
+      ultimate_settled BOOLEAN DEFAULT FALSE,
+      ultimate_winner TEXT
+    );
+  `);
+  
+  await query(`
     CREATE TABLE IF NOT EXISTS cache_metadata (
       key TEXT PRIMARY KEY, 
       last_fetched TIMESTAMP, 
@@ -84,13 +119,23 @@ async function initDatabase() {
   
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bets_user ON bets(user_address);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_bets_match ON bets(match_id);`);
+  await query(`CREATE INDEX IF NOT EXISTS idx_ultimate_bets_user ON ultimate_bets(user_address);`);
+
+  // Seed betting settings if not exists
+  await query(`
+    INSERT INTO betting_settings (id, ultimate_deadline) 
+    VALUES (1, $1)
+    ON CONFLICT (id) DO NOTHING
+  `, [Math.floor(Date.now() / 1000) + 2592000]);
 
   const count = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count || "0");
   console.log(`✅ DB ready — ${count} cached matches`);
   return count;
 }
 
-// ─── Complete World Cup 2026 Fixtures (104 matches) ───────────────────────────
+// ─── Complete World Cup 2026 Fixtures (102 matches) ───────────────────────────
 const WC2026_FIXTURES = [
   // GROUP STAGE - 72 matches (12 groups of 3 teams each)
   // Group A
@@ -246,10 +291,9 @@ async function fetchAndCacheMatches() {
             winner, competition_code, competition_name, group_name, round, stadium, city, season, matchday)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          ON CONFLICT (id) DO UPDATE SET
-           status = EXCLUDED.status,
-           home_score = EXCLUDED.home_score,
-           away_score = EXCLUDED.away_score,
-           winner = EXCLUDED.winner,
+           home_team = EXCLUDED.home_team,
+           away_team = EXCLUDED.away_team,
+           start_time = EXCLUDED.start_time,
            last_updated = CURRENT_TIMESTAMP`,
         [f.id, f.home, f.away, startTime, "SCHEDULED", 0, 0, null,
          "WC", "FIFA World Cup 2026", f.group || null, f.round || null,
@@ -272,14 +316,149 @@ async function fetchAndCacheMatches() {
   return stored;
 }
 
-// Auto-refresh every 6 hours
-function scheduleAutoRefresh() {
-  setInterval(async () => {
-    console.log("🔄 Auto-refreshing matches...");
-    try { await fetchAndCacheMatches(); }
-    catch (e) { console.error("❌ Auto-refresh failed:", e.message); }
-  }, 6 * 60 * 60 * 1000);
-  console.log("⏰ Auto-refresh scheduled every 6 hours");
+// ─── Match Results Fetching ──────────────────────────────────────────────────
+
+/**
+ * Determine winner based on scores
+ */
+function determineWinner(homeScore, awayScore) {
+  if (homeScore > awayScore) return 'HOME_WIN';
+  if (homeScore < awayScore) return 'AWAY_WIN';
+  return 'DRAW';
+}
+
+/**
+ * Fetch results from football-data.org API
+ */
+async function fetchFromFootballData(match) {
+  try {
+    const response = await axios.get(
+      `https://api.football-data.org/v4/matches?ids=${match.id}`,
+      { headers: { 'X-Auth-Token': FOOTBALL_DATA_KEY } }
+    );
+
+    const result = response.data.matches?.[0];
+    if (!result) return;
+
+    if (result.status === 'FINISHED') {
+      const homeScore = result.score.fullTime.home ?? 0;
+      const awayScore = result.score.fullTime.away ?? 0;
+      
+      await updateMatchResult(match.id, {
+        homeScore,
+        awayScore,
+        status: 'FINISHED',
+        winner: determineWinner(homeScore, awayScore)
+      });
+      
+      console.log(`✅ Match ${match.id}: ${match.home_team} ${homeScore}-${awayScore} ${match.away_team}`);
+    } else if (result.status === 'IN_PLAY' || result.status === 'PAUSED') {
+      const homeScore = result.score.fullTime?.home ?? 0;
+      const awayScore = result.score.fullTime?.away ?? 0;
+      
+      await updateMatchResult(match.id, {
+        homeScore,
+        awayScore,
+        status: result.status,
+        winner: null
+      });
+    }
+  } catch (err) {
+    if (err.response?.status !== 404) {
+      console.error(`⚠️ Error fetching match ${match.id}:`, err.message);
+    }
+  }
+}
+
+/**
+ * Fetch results from api-football.com API
+ */
+async function fetchFromApiFootball(match) {
+  try {
+    const response = await axios.get(
+      'https://v3.football.api-sports.io/fixtures',
+      {
+        headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+        params: { id: match.id }
+      }
+    );
+
+    const fixture = response.data.response?.[0];
+    if (!fixture) return;
+
+    const status = fixture.fixture?.status?.short;
+    const homeScore = fixture.goals?.home ?? 0;
+    const awayScore = fixture.goals?.away ?? 0;
+
+    if (status === 'FT' || status === 'AET' || status === 'PEN') {
+      await updateMatchResult(match.id, {
+        homeScore,
+        awayScore,
+        status: 'FINISHED',
+        winner: determineWinner(homeScore, awayScore)
+      });
+      console.log(`✅ Match ${match.id}: ${match.home_team} ${homeScore}-${awayScore} ${match.away_team}`);
+    } else if (['1H', 'HT', '2H', 'ET', 'P', 'LIVE'].includes(status)) {
+      await updateMatchResult(match.id, {
+        homeScore,
+        awayScore,
+        status: 'IN_PLAY',
+        winner: null
+      });
+    }
+  } catch (err) {
+    if (err.response?.status !== 404) {
+      console.error(`⚠️ Error fetching match ${match.id}:`, err.message);
+    }
+  }
+}
+
+/**
+ * Update match result in database
+ */
+async function updateMatchResult(matchId, result) {
+  try {
+    await query(
+      `UPDATE matches 
+       SET home_score = $1, away_score = $2, status = $3, winner = $4, last_updated = CURRENT_TIMESTAMP
+       WHERE id = $5`,
+      [result.homeScore, result.awayScore, result.status, result.winner, matchId]
+    );
+  } catch (err) {
+    console.error(`❌ Error updating match ${matchId}:`, err.message);
+  }
+}
+
+/**
+ * Main function to fetch all live/pending match results
+ */
+async function fetchMatchResults() {
+  const now = Math.floor(Date.now() / 1000);
+  
+  // Fetch matches that started in the last 3 hours or are upcoming within 15 minutes
+  const matches = await query(
+    `SELECT * FROM matches 
+     WHERE start_time <= $1 + 900 
+     AND start_time >= $2 - 10800
+     AND status IN ('SCHEDULED', 'IN_PLAY', 'PAUSED')
+     ORDER BY start_time ASC`,
+    [now, now]
+  );
+
+  if (matches.rows.length === 0) {
+    console.log("📭 No live matches to fetch");
+    return;
+  }
+
+  console.log(`🎯 Fetching results for ${matches.rows.length} matches...`);
+
+  for (const match of matches.rows) {
+    if (FOOTBALL_DATA_KEY) {
+      await fetchFromFootballData(match);
+    } else if (API_FOOTBALL_KEY) {
+      await fetchFromApiFootball(match);
+    }
+  }
 }
 
 // ─── AI Agent ─────────────────────────────────────────────────────────────────
@@ -339,8 +518,11 @@ function formatMatch(row) {
     round: row.round,
     stadium: row.stadium,
     city: row.city,
-    score: { home: row.home_score, away: row.away_score },
+    score: row.home_score !== null ? `${row.home_score} - ${row.away_score}` : null,
+    homeScore: row.home_score,
+    awayScore: row.away_score,
     winner: row.winner,
+    settled: row.status === 'FINISHED',
     pools: {
       home: homePool.toString(),
       draw: drawPool.toString(),
@@ -352,7 +534,8 @@ function formatMatch(row) {
       draw: Number(((drawPool / total) * 100).toFixed(2)),
       away: Number(((awayPool / total) * 100).toFixed(2))
     },
-    bettingOpen: ["SCHEDULED", "TIMED", "IN_PLAY"].includes(row.status)
+    bettingOpen: ["SCHEDULED", "TIMED", "IN_PLAY"].includes(row.status),
+    betDeadline: row.start_time - 300 // 5 minutes before kickoff
   };
 }
 
@@ -362,53 +545,109 @@ function formatMatch(row) {
 
 app.get("/", (req, res) => res.json({
   name: "World Cup 2026 API",
-  description: "Complete 102-match World Cup 2026 schedule",
+  description: "Complete 102-match World Cup 2026 schedule with live result fetching",
   endpoints: {
     matches: "GET /api/matches",
     match: "GET /api/matches/:id",
+    live: "GET /api/matches/live",
     analyze: "GET /api/analyze?home=Brazil&away=Argentina",
+    aiAnalyze: "GET /api/ai/analyze/:matchId",
     stats: "GET /api/stats",
+    userBets: "GET /api/user/:address/bets",
+    placeBet: "POST /api/bets",
+    leaderboard: "GET /api/leaderboard",
+    ultimate: "GET /api/ultimate",
+    resultInput: "POST /api/matches/:id/result",
     refresh: "POST /api/refresh",
+    fetchResults: "POST /api/fetch-results",
     health: "GET /api/health"
   }
 }));
 
+// Health check
 app.get("/api/health", async (req, res) => {
   try {
     const r = await query("SELECT COUNT(*) FROM matches");
+    const now = Math.floor(Date.now() / 1000);
+    const liveCount = await query(
+      "SELECT COUNT(*) FROM matches WHERE start_time <= $1 AND status IN ('SCHEDULED', 'IN_PLAY')",
+      [now + 300]
+    );
     res.json({ 
       status: "ok", 
       matchesInDB: parseInt(r.rows[0].count),
+      liveMatches: parseInt(liveCount.rows[0].count),
+      resultSource: FOOTBALL_DATA_KEY ? 'football-data.org' : (API_FOOTBALL_KEY ? 'api-football' : 'manual'),
       timestamp: new Date().toISOString() 
     });
-  } catch { 
-    res.json({ status: "ok", matchesInDB: 0 }); 
+  } catch (err) { 
+    res.json({ status: "ok", matchesInDB: 0, error: err.message }); 
   }
 });
 
-// GET /api/matches - All matches
+// GET /api/matches - All matches with optional group filter
 app.get("/api/matches", async (req, res) => {
   try {
-    const r = await query("SELECT * FROM matches ORDER BY start_time ASC");
+    const { group, round, status } = req.query;
+    
+    let sql = "SELECT * FROM matches WHERE 1=1";
+    const params = [];
+    let paramCount = 1;
+    
+    if (group) {
+      sql += ` AND group_name = $${paramCount++}`;
+      params.push(group);
+    }
+    if (round) {
+      sql += ` AND round = $${paramCount++}`;
+      params.push(round);
+    }
+    if (status) {
+      sql += ` AND status = $${paramCount++}`;
+      params.push(status);
+    }
+    
+    sql += " ORDER BY start_time ASC";
+    
+    const r = await query(sql, params);
     
     if (r.rows.length === 0) {
       return res.json({
         matches: [],
         total: 0,
-        message: "No matches in database. Run POST /api/refresh to load fixtures."
+        message: "No matches found. Run POST /api/refresh to load fixtures."
       });
     }
     
     res.json({ 
       matches: r.rows.map(formatMatch), 
-      total: r.rows.length 
+      total: r.rows.length,
+      filters: { group: group || null, round: round || null, status: status || null }
     });
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
   }
 });
 
-// GET /api/matches/:id - Single match
+// GET /api/matches/live - Matches currently in play or about to start
+app.get("/api/matches/live", async (req, res) => {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const matches = await query(
+      `SELECT * FROM matches 
+       WHERE (start_time BETWEEN $1 AND $2 AND status = 'SCHEDULED')
+          OR status IN ('IN_PLAY', 'PAUSED')
+          OR (status = 'FINISHED' AND last_updated > NOW() - INTERVAL '2 hours')
+       ORDER BY start_time ASC`,
+      [now - 900, now + 7200]
+    );
+    res.json({ matches: matches.rows.map(formatMatch), total: matches.rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/matches/:id - Single match detail
 app.get("/api/matches/:id", async (req, res) => {
   try {
     const r = await query("SELECT * FROM matches WHERE id=$1", [req.params.id]);
@@ -419,43 +658,245 @@ app.get("/api/matches/:id", async (req, res) => {
   }
 });
 
-// GET /api/stats - Match statistics
+// POST /api/matches/:id/result - Manual result input (admin/testing)
+app.post("/api/matches/:id/result", async (req, res) => {
+  const { homeScore, awayScore, status: matchStatus } = req.body;
+  const matchId = parseInt(req.params.id);
+  
+  if (isNaN(matchId)) return res.status(400).json({ error: "Invalid match ID" });
+  if (homeScore === undefined || awayScore === undefined) {
+    return res.status(400).json({ error: "homeScore and awayScore required" });
+  }
+  
+  try {
+    const match = await query("SELECT * FROM matches WHERE id = $1", [matchId]);
+    if (!match.rows.length) return res.status(404).json({ error: "Match not found" });
+    
+    const status = matchStatus || 'FINISHED';
+    const winner = status === 'FINISHED' ? determineWinner(homeScore, awayScore) : null;
+    
+    await updateMatchResult(matchId, {
+      homeScore,
+      awayScore,
+      status,
+      winner
+    });
+    
+    const updated = await query("SELECT * FROM matches WHERE id = $1", [matchId]);
+    
+    res.json({ 
+      success: true, 
+      message: `Match ${matchId} updated`,
+      match: formatMatch(updated.rows[0])
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/stats - Complete platform statistics
 app.get("/api/stats", async (req, res) => {
   try {
-    const [total, byGroup, byRound] = await Promise.all([
+    const [matches, bets, users, volume, byGroup, byRound] = await Promise.all([
       query("SELECT COUNT(*) FROM matches"),
-      query("SELECT group_name, COUNT(*) FROM matches WHERE group_name IS NOT NULL GROUP BY group_name"),
+      query("SELECT COUNT(*) FROM bets"),
+      query("SELECT COUNT(DISTINCT user_address) FROM bets"),
+      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets"),
+      query("SELECT group_name, COUNT(*) FROM matches WHERE group_name IS NOT NULL GROUP BY group_name ORDER BY group_name"),
       query("SELECT round, COUNT(*) FROM matches WHERE round IS NOT NULL GROUP BY round ORDER BY MIN(id)")
     ]);
     
     res.json({
-      matchCount: parseInt(total.rows[0].count),
+      matchCount: parseInt(matches.rows[0].count),
+      totalBets: parseInt(bets.rows[0].count),
+      uniqueUsers: parseInt(users.rows[0].count),
+      totalVolumeCLUTCH: volume.rows[0].total || 0,
       groups: byGroup.rows,
       rounds: byRound.rows,
-      note: "All times in UTC"
+      timestamp: new Date().toISOString()
     });
   } catch (err) { 
-    res.status(500).json({ error: err.message }); 
+    // Fallback if tables don't exist yet
+    try {
+      const total = await query("SELECT COUNT(*) FROM matches");
+      res.json({
+        matchCount: parseInt(total.rows[0].count),
+        totalBets: 0,
+        uniqueUsers: 0,
+        totalVolumeCLUTCH: 0,
+        groups: [],
+        rounds: []
+      });
+    } catch {
+      res.status(500).json({ error: err.message });
+    }
   }
 });
 
-// POST /api/refresh - Load/refresh fixtures
-app.post("/api/refresh", async (req, res) => {
+// GET /api/user/:address/bets - User betting history
+app.get("/api/user/:address/bets", async (req, res) => {
+  const userAddress = req.params.address.toLowerCase();
+  
   try {
-    const stored = await fetchAndCacheMatches();
-    const total = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count);
+    const [matchBets, ultimateBets] = await Promise.all([
+      query(
+        `SELECT b.*, m.home_team, m.away_team, m.home_score, m.away_score, 
+                m.winner as match_outcome, m.status as match_status
+         FROM bets b 
+         LEFT JOIN matches m ON b.match_id = m.id 
+         WHERE b.user_address = $1 
+         ORDER BY b.created_at DESC`,
+        [userAddress]
+      ),
+      query(
+        "SELECT * FROM ultimate_bets WHERE user_address = $1 ORDER BY created_at DESC",
+        [userAddress]
+      )
+    ]);
+    
+    res.json({ 
+      matchBets: matchBets.rows, 
+      ultimateBets: ultimateBets.rows 
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/bets - Record bet after on-chain transaction
+app.post("/api/bets", async (req, res) => {
+  const { matchId, userAddress, prediction, amount, txHash } = req.body;
+  
+  if (!matchId || !userAddress || !prediction || !amount) {
+    return res.status(400).json({ error: "Missing required fields: matchId, userAddress, prediction, amount" });
+  }
+  
+  try {
+    const result = await query(
+      "INSERT INTO bets (match_id, user_address, prediction, amount, tx_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+      [matchId, userAddress.toLowerCase(), prediction, amount.toString(), txHash || null]
+    );
+    
     res.json({ 
       success: true, 
-      stored, 
-      totalMatches: total,
-      message: `Loaded ${stored} World Cup matches`
+      betId: result.rows[0].id,
+      message: "Bet recorded in database"
     });
-  } catch (err) { 
-    res.status(500).json({ success: false, error: err.message }); 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/analyze - AI analysis
+// POST /api/ultimate-bets - Record ultimate bet
+app.post("/api/ultimate-bets", async (req, res) => {
+  const { userAddress, team, amount, txHash } = req.body;
+  
+  if (!userAddress || !team || !amount) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  
+  try {
+    await query(
+      "INSERT INTO ultimate_bets (user_address, team, amount, tx_hash) VALUES ($1, $2, $3, $4)",
+      [userAddress.toLowerCase(), team, amount.toString(), txHash || null]
+    );
+    
+    res.json({ success: true, message: "Ultimate bet recorded" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/leaderboard - Top predictors
+app.get("/api/leaderboard", async (req, res) => {
+  try {
+    const [leaderboard, ultimateStats] = await Promise.all([
+      query(
+        `SELECT 
+           user_address as user, 
+           COUNT(*) as bet_count, 
+           COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total_wagered,
+           COUNT(CASE WHEN claimed = true THEN 1 END) as wins_claimed
+         FROM bets 
+         GROUP BY user_address 
+         ORDER BY total_wagered DESC 
+         LIMIT 20`
+      ),
+      query(
+        `SELECT 
+           user_address as user, 
+           COUNT(*) as ultimate_bets,
+           COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as ultimate_wagered
+         FROM ultimate_bets
+         GROUP BY user_address
+         ORDER BY ultimate_wagered DESC
+         LIMIT 20`
+      )
+    ]);
+    
+    res.json({ 
+      leaderboard: leaderboard.rows,
+      ultimateLeaderboard: ultimateStats.rows
+    });
+  } catch (err) {
+    // Fallback if tables don't exist
+    res.json({ 
+      leaderboard: [],
+      ultimateLeaderboard: [],
+      message: "No data yet - start placing bets!"
+    });
+  }
+});
+
+// GET /api/ultimate - Ultimate bet status and pools
+app.get("/api/ultimate", async (req, res) => {
+  try {
+    const [totalPool, teamPools, settings] = await Promise.all([
+      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM ultimate_bets"),
+      query("SELECT team, SUM(CAST(amount AS DECIMAL)) as amount FROM ultimate_bets GROUP BY team ORDER BY amount DESC"),
+      query("SELECT * FROM betting_settings WHERE id = 1")
+    ]);
+    
+    const setting = settings.rows[0] || {};
+    
+    res.json({
+      deadline: setting.ultimate_deadline || Math.floor(Date.now() / 1000) + 2592000,
+      settled: setting.ultimate_settled || false,
+      winner: setting.ultimate_winner || null,
+      totalPool: totalPool.rows[0].total || "0",
+      teamPools: teamPools.rows
+    });
+  } catch (err) {
+    // Fallback
+    res.json({
+      deadline: Math.floor(Date.now() / 1000) + 2592000,
+      settled: false,
+      winner: null,
+      totalPool: "0",
+      teamPools: []
+    });
+  }
+});
+
+// POST /api/ultimate/settle - Settle ultimate bet (admin)
+app.post("/api/ultimate/settle", async (req, res) => {
+  const { winner } = req.body;
+  
+  if (!winner) return res.status(400).json({ error: "winner required" });
+  
+  try {
+    await query(
+      "UPDATE betting_settings SET ultimate_settled = true, ultimate_winner = $1 WHERE id = 1",
+      [winner]
+    );
+    
+    res.json({ success: true, message: `Ultimate bet settled! Winner: ${winner}` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/analyze - AI analysis by team names
 app.get("/api/analyze", async (req, res) => {
   const { home, away } = req.query;
   if (!home || !away) return res.status(400).json({ error: "Provide home and away" });
@@ -475,7 +916,7 @@ app.get("/api/analyze", async (req, res) => {
   }
 });
 
-// GET /api/ai/analyze/:matchId - Analyze match by ID
+// GET /api/ai/analyze/:matchId - AI analysis by match ID
 app.get("/api/ai/analyze/:matchId", async (req, res) => {
   try {
     const r = await query("SELECT * FROM matches WHERE id=$1", [req.params.matchId]);
@@ -497,29 +938,100 @@ app.get("/api/ai/analyze/:matchId", async (req, res) => {
   }
 });
 
-// Mock endpoints for frontend
-app.get("/api/leaderboard", (req, res) => res.json({
-  leaderboard: [
-    { user: "0x1234...5678", total_wagered: "50000", bet_count: 23 },
-    { user: "0x2345...6789", total_wagered: "45000", bet_count: 19 }
-  ]
-}));
+// POST /api/refresh - Reload fixtures from hardcoded list
+app.post("/api/refresh", async (req, res) => {
+  try {
+    const stored = await fetchAndCacheMatches();
+    const total = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count);
+    res.json({ 
+      success: true, 
+      stored, 
+      totalMatches: total,
+      message: `Loaded ${stored} World Cup matches`
+    });
+  } catch (err) { 
+    res.status(500).json({ success: false, error: err.message }); 
+  }
+});
 
-app.get("/api/ultimate", (req, res) => res.json({
-  deadline: Math.floor(Date.now()/1000) + 2592000,
-  settled: false,
-  winner: null,
-  totalPool: "168000",
-  teamPools: [
-    { team: "Brazil", amount: "45000" },
-    { team: "Argentina", amount: "38000" }
-  ]
-}));
+// POST /api/fetch-results - Manually trigger result fetching
+app.post("/api/fetch-results", async (req, res) => {
+  try {
+    if (!FOOTBALL_DATA_KEY && !API_FOOTBALL_KEY) {
+      return res.json({ 
+        success: false, 
+        message: "No API key configured. Set FOOTBALL_DATA_API_KEY or API_FOOTBALL_KEY.",
+        availableSources: ['football-data.org', 'api-football.com']
+      });
+    }
+    
+    console.log("🔄 Manual result fetch triggered");
+    await fetchMatchResults();
+    
+    const updated = await query(
+      "SELECT COUNT(*) FROM matches WHERE status = 'FINISHED' AND last_updated > NOW() - INTERVAL '1 minute'"
+    );
+    
+    res.json({ 
+      success: true, 
+      message: "Results fetched",
+      updatedMatches: parseInt(updated.rows[0].count)
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Scheduling ───────────────────────────────────────────────────────────────
+
+function scheduleAutoRefresh() {
+  setInterval(async () => {
+    console.log("🔄 Auto-refreshing matches...");
+    try { await fetchAndCacheMatches(); }
+    catch (e) { console.error("❌ Auto-refresh failed:", e.message); }
+  }, 6 * 60 * 60 * 1000);
+  console.log("⏰ Auto-refresh scheduled every 6 hours");
+}
+
+function scheduleResultFetching() {
+  if (!FOOTBALL_DATA_KEY && !API_FOOTBALL_KEY) {
+    console.log("⚠️ No result API keys configured. Use POST /api/matches/:id/result for manual input.");
+    console.log("   Get a free key at: https://www.football-data.org/ or https://www.api-football.com/");
+    
+    // Still run to check if there are manual updates needed
+    setInterval(() => {
+      console.log("⏰ No auto-fetch keys configured. Results must be entered manually.");
+    }, 30 * 60 * 1000);
+    return;
+  }
+
+  setInterval(async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const liveMatches = await query(
+      `SELECT COUNT(*) FROM matches 
+       WHERE start_time <= $1 + 900 
+       AND start_time >= $2 - 10800
+       AND status IN ('SCHEDULED', 'IN_PLAY', 'PAUSED')`,
+      [now, now]
+    ).catch(() => ({ rows: [{ count: 0 }] }));
+    
+    const count = parseInt(liveMatches.rows[0].count);
+    if (count > 0) {
+      console.log(`🎯 ${count} potential live matches - fetching results...`);
+      await fetchMatchResults();
+    }
+  }, 5 * 60 * 1000); // Every 5 minutes
+  
+  console.log("⏰ Live result fetching scheduled every 5 minutes");
+}
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 async function start() {
   console.log("\n" + "=".repeat(55));
   console.log("🌍 World Cup 2026 API");
+  console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Google Gemini' : '❌ Missing'}`);
+  console.log(`📊 Results: ${FOOTBALL_DATA_KEY ? '✅ football-data.org' : (API_FOOTBALL_KEY ? '✅ api-football' : '⚠️ Manual input only')}`);
+  console.log(`🗄️  DB: ${DATABASE_URL ? '✅ Neon PostgreSQL' : '❌ Missing'}`);
   console.log("=".repeat(55));
 
   const matchCount = await initDatabase();
@@ -532,13 +1044,21 @@ async function start() {
   }
 
   scheduleAutoRefresh();
+  scheduleResultFetching();
 
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
     console.log(`\n🚀 Server running on port ${PORT}`);
-    console.log(`⚽ Matches  : GET /api/matches`);
-    console.log(`🤖 Analyze  : GET /api/analyze?home=Brazil&away=Argentina`);
-    console.log(`🔄 Refresh  : POST /api/refresh`);
+    console.log(`⚽ Matches     : GET  /api/matches`);
+    console.log(`🔴 Live       : GET  /api/matches/live`);
+    console.log(`🤖 AI Analyze : GET  /api/ai/analyze/:matchId`);
+    console.log(`📊 Stats      : GET  /api/stats`);
+    console.log(`👤 My Bets    : GET  /api/user/:address/bets`);
+    console.log(`🏆 Ultimate   : GET  /api/ultimate`);
+    console.log(`🏅 Leaderboard: GET  /api/leaderboard`);
+    console.log(`✏️  Results    : POST /api/matches/:id/result (manual)`);
+    console.log(`🔄 Refresh    : POST /api/refresh`);
+    console.log(`📡 Fetch Live : POST /api/fetch-results`);
     console.log("=".repeat(55));
   });
 }
