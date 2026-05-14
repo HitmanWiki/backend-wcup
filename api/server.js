@@ -501,12 +501,6 @@ function stableRandom(seed, min, max) {
 }
 
 function formatMatch(row) {
-  const s = row.id;
-  const homePool = stableRandom(s * 1, 50, 150);
-  const drawPool = stableRandom(s * 2, 20, 70);
-  const awayPool = stableRandom(s * 3, 40, 120);
-  const total = homePool + drawPool + awayPool;
-  
   return {
     id: row.id,
     homeTeam: row.home_team,
@@ -523,22 +517,11 @@ function formatMatch(row) {
     awayScore: row.away_score,
     winner: row.winner,
     settled: row.status === 'FINISHED',
-    pools: {
-      home: homePool.toString(),
-      draw: drawPool.toString(),
-      away: awayPool.toString(),
-      total: total.toString()
-    },
-    odds: {
-      home: Number(((homePool / total) * 100).toFixed(2)),
-      draw: Number(((drawPool / total) * 100).toFixed(2)),
-      away: Number(((awayPool / total) * 100).toFixed(2))
-    },
-    bettingOpen: ["SCHEDULED", "TIMED", "IN_PLAY"].includes(row.status),
-    betDeadline: row.start_time - 300 // 5 minutes before kickoff
+    // NO pools/odds here - frontend fetches from contract
+    bettingOpen: row.status === 'SCHEDULED',
+    betDeadline: row.start_time - 300
   };
 }
-
 // ════════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ════════════════════════════════════════════════════════════════════════
