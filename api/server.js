@@ -1140,7 +1140,7 @@ async function start() {
   }
 
   // Initialize admin wallet for contract automation
-  const adminReady = initAdmin();
+  // const adminReady = initAdmin();
 
   scheduleAutoRefresh();
   scheduleResultFetching();
