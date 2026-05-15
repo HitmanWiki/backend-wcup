@@ -9,6 +9,7 @@ const cors    = require("cors");
 const axios   = require("axios");
 const { Pool } = require("pg");
 const AIMatchAgent = require("./ai-match-agent.js");
+const { ethers } = require("ethers");
 
 const app = express();
 app.use(cors());
@@ -19,6 +20,10 @@ const GEMINI_API_KEY      = process.env.GEMINI_API_KEY;
 const DATABASE_URL        = process.env.DATABASE_URL;
 const FOOTBALL_DATA_KEY   = process.env.FOOTBALL_DATA_API_KEY;
 const API_FOOTBALL_KEY    = process.env.API_FOOTBALL_KEY;
+const ADMIN_PRIVATE_KEY = process.env.ADMIN_PRIVATE_KEY || '';
+const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || '';
+const BETTING_ADDRESS = process.env.BETTING_ADDRESS || '';
+const RPC_URL = process.env.RPC_URL || 'https://mainnet.base.org';
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
 if (!DATABASE_URL)   { console.error("DATABASE_URL missing");     process.exit(1); }
@@ -54,6 +59,7 @@ async function initDatabase() {
       home_score       INTEGER   DEFAULT 0,
       away_score       INTEGER   DEFAULT 0,
       winner           TEXT,
+      settled_onchain  BOOLEAN DEFAULT FALSE,
       competition_code TEXT,
       competition_name TEXT,
       group_name       TEXT,
@@ -96,7 +102,8 @@ async function initDatabase() {
       id INTEGER PRIMARY KEY DEFAULT 1,
       ultimate_deadline BIGINT NOT NULL DEFAULT 0,
       ultimate_settled BOOLEAN DEFAULT FALSE,
-      ultimate_winner TEXT
+      ultimate_winner TEXT,
+      ultimate_settled_onchain BOOLEAN DEFAULT FALSE
     );
   `);
   
@@ -122,6 +129,34 @@ async function initDatabase() {
   await query(`CREATE INDEX IF NOT EXISTS idx_bets_user ON bets(user_address);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_bets_match ON bets(match_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_ultimate_bets_user ON ultimate_bets(user_address);`);
+
+  // ─── Admin Wallet & Contract ────────────────────────────────────────────────
+let adminWallet = null;
+let bettingContract = null;
+
+function initAdmin() {
+  if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
+    console.log("⚠️ Admin not configured - contract automation disabled");
+    return false;
+  }
+  try {
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
+    adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+    bettingContract = new ethers.Contract(BETTING_ADDRESS, [
+      "function createMatch(string,string,uint256,uint256) returns (uint256)",
+      "function settleMatch(uint256,uint8)",
+      "function settleUltimate(string)",
+      "function matchCount() view returns (uint256)",
+      "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
+      "function ultimateSettled() view returns (bool)"
+    ], adminWallet);
+    console.log(`✅ Admin wallet: ${adminWallet.address}`);
+    return true;
+  } catch (e) {
+    console.error("❌ Admin init failed:", e.message);
+    return false;
+  }
+}
 
   // Seed betting settings if not exists
   await query(`
@@ -522,6 +557,77 @@ function formatMatch(row) {
     betDeadline: row.start_time - 300
   };
 }
+// ─── Contract Automation ──────────────────────────────────────────────────────
+async function autoCreateMatchesOnChain() {
+  if (!bettingContract) return;
+  try {
+    const count = await bettingContract.matchCount();
+    if (count > 0n) { console.log(`📊 ${count} matches already on-chain`); return; }
+  } catch (e) { console.error("matchCount failed:", e.message); return; }
+  
+  console.log("🔄 Creating matches on-chain...");
+  const { rows } = await query("SELECT * FROM matches WHERE round = 'Group Stage' ORDER BY id");
+  
+  let created = 0;
+  for (const match of rows) {
+    try {
+      const betDeadline = match.start_time - 300;
+      const tx = await bettingContract.createMatch(match.home_team, match.away_team, match.start_time, betDeadline);
+      await tx.wait();
+      created++;
+      console.log(`✅ On-chain: ${match.id} ${match.home_team} vs ${match.away_team}`);
+    } catch (e) { console.warn(`⚠️ Match ${match.id}:`, e.message.slice(0, 80)); }
+  }
+  console.log(`🎉 Created ${created} matches on-chain`);
+}
+
+async function autoSettleMatchesOnChain() {
+  if (!bettingContract) return;
+  const { rows } = await query("SELECT * FROM matches WHERE status = 'FINISHED' AND winner IS NOT NULL AND settled_onchain = FALSE");
+  
+  for (const match of rows) {
+    try {
+      const contractMatch = await bettingContract.getMatch(match.id);
+      if (contractMatch[5]) { await query("UPDATE matches SET settled_onchain = TRUE WHERE id = $1", [match.id]); continue; }
+      
+      const outcomeMap = { 'HOME_WIN': 1, 'DRAW': 2, 'AWAY_WIN': 3 };
+      const outcome = outcomeMap[match.winner];
+      if (!outcome) continue;
+      
+      console.log(`🤖 Settling match ${match.id}: ${match.winner}`);
+      const tx = await bettingContract.settleMatch(match.id, outcome);
+      await tx.wait();
+      await query("UPDATE matches SET settled_onchain = TRUE WHERE id = $1", [match.id]);
+      console.log(`✅ Match ${match.id} settled on-chain`);
+    } catch (e) { console.error(`❌ Settle ${match.id}:`, e.message.slice(0, 80)); }
+  }
+}
+
+async function autoSettleUltimateOnChain() {
+  if (!bettingContract) return;
+  const { rows } = await query("SELECT * FROM betting_settings WHERE id = 1 AND ultimate_settled = TRUE AND ultimate_winner IS NOT NULL AND ultimate_settled_onchain = FALSE");
+  if (!rows.length) return;
+  
+  const winner = rows[0].ultimate_winner;
+  try {
+    const isSettled = await bettingContract.ultimateSettled();
+    if (isSettled) { await query("UPDATE betting_settings SET ultimate_settled_onchain = TRUE WHERE id = 1"); return; }
+    
+    console.log(`🤖 Settling Ultimate: ${winner}`);
+    const tx = await bettingContract.settleUltimate(winner);
+    await tx.wait();
+    await query("UPDATE betting_settings SET ultimate_settled_onchain = TRUE WHERE id = 1");
+    console.log(`✅ Ultimate settled: ${winner}`);
+  } catch (e) { console.error("❌ Ultimate:", e.message.slice(0, 80)); }
+}
+
+async function runAutomation() {
+  if (!bettingContract) return;
+  console.log("🤖 Running automation...");
+  await autoCreateMatchesOnChain();
+  await autoSettleMatchesOnChain();
+  await autoSettleUltimateOnChain();
+}
 // ════════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ════════════════════════════════════════════════════════════════════════
@@ -567,7 +673,13 @@ app.get("/api/health", async (req, res) => {
     res.json({ status: "ok", matchesInDB: 0, error: err.message }); 
   }
 });
-
+// Add after POST /api/fetch-results route:
+app.post("/api/admin/run-automation", async (req, res) => {
+  try {
+    await runAutomation();
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
 // GET /api/matches - All matches with optional group filter
 app.get("/api/matches", async (req, res) => {
   try {
@@ -1015,6 +1127,7 @@ async function start() {
   console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Google Gemini' : '❌ Missing'}`);
   console.log(`📊 Results: ${FOOTBALL_DATA_KEY ? '✅ football-data.org' : (API_FOOTBALL_KEY ? '✅ api-football' : '⚠️ Manual input only')}`);
   console.log(`🗄️  DB: ${DATABASE_URL ? '✅ Neon PostgreSQL' : '❌ Missing'}`);
+  console.log(`🔗 Contract: ${BETTING_ADDRESS ? '✅ Configured' : '⚠️ Not set'}`);
   console.log("=".repeat(55));
 
   const matchCount = await initDatabase();
@@ -1026,8 +1139,21 @@ async function start() {
     console.log(`📊 Serving ${matchCount} World Cup matches from DB`);
   }
 
+  // Initialize admin wallet for contract automation
+  const adminReady = initAdmin();
+
   scheduleAutoRefresh();
   scheduleResultFetching();
+
+  // Schedule contract automation if admin configured
+  if (adminReady) {
+    // Run immediately on startup
+    setTimeout(runAutomation, 5000); // 5s delay to ensure everything is ready
+    
+    // Then every 5 minutes
+    setInterval(runAutomation, 5 * 60 * 1000);
+    console.log("⏰ Contract automation scheduled every 5 minutes");
+  }
 
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
@@ -1042,6 +1168,7 @@ async function start() {
     console.log(`✏️  Results    : POST /api/matches/:id/result (manual)`);
     console.log(`🔄 Refresh    : POST /api/refresh`);
     console.log(`📡 Fetch Live : POST /api/fetch-results`);
+    console.log(`🤖 Automation : ${adminReady ? '✅ ENABLED' : '⚠️ DISABLED (set ADMIN_PRIVATE_KEY)'}`);
     console.log("=".repeat(55));
   });
 }
