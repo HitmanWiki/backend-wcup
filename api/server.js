@@ -560,51 +560,42 @@ async function autoCreateMatchesOnChain() {
   if (!bettingContract) return;
 
   try {
-    // Check how many matches exist on-chain
     const count = await bettingContract.matchCount();
     const onChainCount = Number(count);
-    console.log(`📊 ${onChainCount} matches already on-chain`);
     
-    // Get all group stage matches from DB
+    // If already have 70+ matches, skip creation entirely
+    if (onChainCount >= 70) {
+      console.log(`📊 ${onChainCount} matches already on-chain - skipping creation`);
+      return;
+    }
+    
+    console.log(`📊 ${onChainCount} matches on-chain, checking for missing...`);
+    
     const { rows } = await query(
       "SELECT * FROM matches WHERE round = 'Group Stage' ORDER BY id"
     );
     
-    console.log(`📋 ${rows.length} group matches in DB`);
-    
     let created = 0;
     
     for (const match of rows) {
-      // Skip if match already exists on-chain (contract IDs start at 0)
-      if (match.id - 1 < onChainCount) {
-        continue;
-      }
+      // Skip if match already exists on-chain
+      if (match.id - 1 < onChainCount) continue;
       
       try {
-        const betDeadline = match.start_time - 300; // 5 min before kickoff
-        
-        console.log(`🔄 Creating match ${match.id}: ${match.home_team} vs ${match.away_team}`);
-        
+        const betDeadline = match.start_time - 300;
         const tx = await bettingContract.createMatch(
-          match.home_team,
-          match.away_team,
-          match.start_time,
-          betDeadline
+          match.home_team, match.away_team, match.start_time, betDeadline
         );
         await tx.wait();
-        
         created++;
         console.log(`✅ On-chain: ${match.id} ${match.home_team} vs ${match.away_team}`);
-        
-        // Small delay to avoid rate limiting
-        await new Promise(r => setTimeout(r, 1000));
-        
+        await new Promise(r => setTimeout(r, 200));
       } catch (e) {
-        console.warn(`⚠️ Match ${match.id} failed:`, e.message?.slice(0, 80));
+        console.warn(`⚠️ Match ${match.id}:`, e.message?.slice(0, 60));
       }
     }
     
-    console.log(`🎉 Created ${created} new matches on-chain`);
+    if (created > 0) console.log(`🎉 Created ${created} new matches`);
     
   } catch (err) {
     console.error('❌ autoCreateMatchesOnChain error:', err.message);
