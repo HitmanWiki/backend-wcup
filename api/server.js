@@ -1135,18 +1135,15 @@ async function start() {
     console.log(`📊 Serving ${matchCount} World Cup matches from DB`);
   }
 
-  // Initialize admin wallet for contract automation
-  // const adminReady = initAdmin();
+  // Initialize admin for automation
+  const adminReady = initAdmin();
 
   scheduleAutoRefresh();
   scheduleResultFetching();
 
   // Schedule contract automation if admin configured
   if (adminReady) {
-    // Run immediately on startup
     setTimeout(runAutomation, 5000); // 5s delay to ensure everything is ready
-    
-    // Then every 5 minutes
     setInterval(runAutomation, 5 * 60 * 1000);
     console.log("⏰ Contract automation scheduled every 5 minutes");
   }
@@ -1155,16 +1152,7 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`\n🚀 Server running on port ${PORT}`);
     console.log(`⚽ Matches     : GET  /api/matches`);
-    console.log(`🔴 Live       : GET  /api/matches/live`);
-    console.log(`🤖 AI Analyze : GET  /api/ai/analyze/:matchId`);
-    console.log(`📊 Stats      : GET  /api/stats`);
-    console.log(`👤 My Bets    : GET  /api/user/:address/bets`);
-    console.log(`🏆 Ultimate   : GET  /api/ultimate`);
-    console.log(`🏅 Leaderboard: GET  /api/leaderboard`);
-    console.log(`✏️  Results    : POST /api/matches/:id/result (manual)`);
-    console.log(`🔄 Refresh    : POST /api/refresh`);
-    console.log(`📡 Fetch Live : POST /api/fetch-results`);
-    console.log(`🤖 Automation : ${adminReady ? '✅ ENABLED' : '⚠️ DISABLED (set ADMIN_PRIVATE_KEY)'}`);
+    console.log(`🤖 Automation : ${adminReady ? '✅ ENABLED' : '⚠️ DISABLED'}`);
     console.log("=".repeat(55));
   });
 }
