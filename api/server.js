@@ -581,50 +581,129 @@ async function autoCreateMatchesOnChain() {
 
 async function autoSettleMatchesOnChain() {
   if (!bettingContract) return;
-  const { rows } = await query("SELECT * FROM matches WHERE status = 'FINISHED' AND winner IS NOT NULL AND settled_onchain = FALSE");
-  
-  for (const match of rows) {
-    try {
-      const contractMatch = await bettingContract.getMatch(match.id);
-      if (contractMatch[5]) { await query("UPDATE matches SET settled_onchain = TRUE WHERE id = $1", [match.id]); continue; }
-      
-      const outcomeMap = { 'HOME_WIN': 1, 'DRAW': 2, 'AWAY_WIN': 3 };
-      const outcome = outcomeMap[match.winner];
-      if (!outcome) continue;
-      
-      console.log(`🤖 Settling match ${match.id}: ${match.winner}`);
-      const tx = await bettingContract.settleMatch(match.id, outcome);
-      await tx.wait();
-      await query("UPDATE matches SET settled_onchain = TRUE WHERE id = $1", [match.id]);
-      console.log(`✅ Match ${match.id} settled on-chain`);
-    } catch (e) { console.error(`❌ Settle ${match.id}:`, e.message.slice(0, 80)); }
+
+  try {
+    // Get finished matches that have a winner
+    const { rows } = await query(
+      "SELECT * FROM matches WHERE status = 'FINISHED' AND winner IS NOT NULL AND winner != ''"
+    );
+
+    if (rows.length === 0) return;
+
+    console.log(`🎯 Found ${rows.length} finished matches to check`);
+
+    for (const match of rows) {
+      try {
+        // Check if already settled on-chain
+        const contractMatch = await bettingContract.getMatch(match.id);
+        
+        // If already settled, skip
+        if (contractMatch[5]) {
+          console.log(`⏭️ Match ${match.id} already settled on-chain`);
+          continue;
+        }
+
+        // Map winner to contract enum
+        const outcomeMap = {
+          'HOME_WIN': 1,
+          'DRAW': 2,
+          'AWAY_WIN': 3
+        };
+        
+        const outcome = outcomeMap[match.winner];
+        if (!outcome) {
+          console.warn(`⚠️ Unknown winner for match ${match.id}: ${match.winner}`);
+          continue;
+        }
+
+        console.log(`🤖 Settling match ${match.id}: ${match.home_team} vs ${match.away_team} → ${match.winner}`);
+        
+        const tx = await bettingContract.settleMatch(match.id, outcome);
+        await tx.wait();
+        
+        console.log(`✅ Match ${match.id} settled on-chain`);
+        
+        // Small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 2000));
+        
+      } catch (e) {
+        // Skip individual match errors
+        if (e.message?.includes('already settled')) {
+          console.log(`⏭️ Match ${match.id} already settled`);
+        } else if (e.message?.includes('match not started')) {
+          console.log(`⏭️ Match ${match.id} hasn't started yet`);
+        } else {
+          console.error(`❌ Settle match ${match.id} failed:`, e.message?.slice(0, 100));
+        }
+      }
+    }
+    
+  } catch (err) {
+    console.error('❌ autoSettleMatchesOnChain error:', err.message);
+    // Don't crash the server
   }
 }
-
 async function autoSettleUltimateOnChain() {
   if (!bettingContract) return;
-  const { rows } = await query("SELECT * FROM betting_settings WHERE id = 1 AND ultimate_settled = TRUE AND ultimate_winner IS NOT NULL AND ultimate_settled_onchain = FALSE");
-  if (!rows.length) return;
-  
-  const winner = rows[0].ultimate_winner;
+
   try {
-    const isSettled = await bettingContract.ultimateSettled();
-    if (isSettled) { await query("UPDATE betting_settings SET ultimate_settled_onchain = TRUE WHERE id = 1"); return; }
+    const { rows } = await query(
+      "SELECT * FROM betting_settings WHERE id = 1 AND ultimate_settled = TRUE AND ultimate_winner IS NOT NULL"
+    );
+
+    if (!rows.length) return;
+
+    const winner = rows[0].ultimate_winner;
+
+    try {
+      const isSettled = await bettingContract.ultimateSettled();
+      if (isSettled) {
+        console.log('🏆 Ultimate already settled on-chain');
+        return;
+      }
+
+      console.log(`🤖 Settling Ultimate: ${winner}`);
+      const tx = await bettingContract.settleUltimate(winner);
+      await tx.wait();
+      console.log(`✅ Ultimate settled on-chain: ${winner}`);
+      
+    } catch (e) {
+      if (e.message?.includes('already settled')) {
+        console.log('⏭️ Ultimate already settled');
+      } else {
+        console.error('❌ Ultimate settle failed:', e.message?.slice(0, 100));
+      }
+    }
     
-    console.log(`🤖 Settling Ultimate: ${winner}`);
-    const tx = await bettingContract.settleUltimate(winner);
-    await tx.wait();
-    await query("UPDATE betting_settings SET ultimate_settled_onchain = TRUE WHERE id = 1");
-    console.log(`✅ Ultimate settled: ${winner}`);
-  } catch (e) { console.error("❌ Ultimate:", e.message.slice(0, 80)); }
+  } catch (err) {
+    console.error('❌ autoSettleUltimateOnChain error:', err.message);
+  }
 }
 
 async function runAutomation() {
   if (!bettingContract) return;
-  console.log("🤖 Running automation...");
-  await autoCreateMatchesOnChain();
-  await autoSettleMatchesOnChain();
-  await autoSettleUltimateOnChain();
+  
+  console.log('🤖 Running automation...');
+  
+  try {
+    await autoCreateMatchesOnChain();
+  } catch (e) {
+    console.error('❌ createMatches error:', e.message);
+  }
+  
+  try {
+    await autoSettleMatchesOnChain();
+  } catch (e) {
+    console.error('❌ settleMatches error:', e.message);
+  }
+  
+  try {
+    await autoSettleUltimateOnChain();
+  } catch (e) {
+    console.error('❌ settleUltimate error:', e.message);
+  }
+  
+  console.log('✅ Automation complete');
 }
 // ════════════════════════════════════════════════════════════════════════
 //  ROUTES
