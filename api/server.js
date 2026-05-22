@@ -44,6 +44,34 @@ const query = async (text, params) => {
   catch (err) { console.error("Query error:", err.message); throw err; }
 };
 
+ // ─── Admin Wallet & Contract ────────────────────────────────────────────────
+  let adminWallet = null;
+  let bettingContract = null;
+
+  function initAdmin() {
+    if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
+      console.log("⚠️ Admin not configured - contract automation disabled");
+      return false;
+    }
+    try {
+      const provider = new ethers.JsonRpcProvider(RPC_URL);
+      adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+      bettingContract = new ethers.Contract(BETTING_ADDRESS, [
+        "function createMatch(string,string,uint256,uint256) returns (uint256)",
+        "function settleMatch(uint256,uint8)",
+        "function settleUltimate(string)",
+        "function matchCount() view returns (uint256)",
+        "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
+        "function ultimateSettled() view returns (bool)"
+      ], adminWallet);
+      console.log(`✅ Admin wallet: ${adminWallet.address}`);
+      return true;
+    } catch (e) {
+      console.error("❌ Admin init failed:", e.message);
+      return false;
+    }
+  }
+
 // ─── DB init ──────────────────────────────────────────────────────────────────
 async function initDatabase() {
   await query(`
@@ -121,33 +149,7 @@ async function initDatabase() {
     );
   `);
 
-  // ─── Admin Wallet & Contract ────────────────────────────────────────────────
-  let adminWallet = null;
-  let bettingContract = null;
-
-  function initAdmin() {
-    if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
-      console.log("⚠️ Admin not configured - contract automation disabled");
-      return false;
-    }
-    try {
-      const provider = new ethers.JsonRpcProvider(RPC_URL);
-      adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
-      bettingContract = new ethers.Contract(BETTING_ADDRESS, [
-        "function createMatch(string,string,uint256,uint256) returns (uint256)",
-        "function settleMatch(uint256,uint8)",
-        "function settleUltimate(string)",
-        "function matchCount() view returns (uint256)",
-        "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
-        "function ultimateSettled() view returns (bool)"
-      ], adminWallet);
-      console.log(`✅ Admin wallet: ${adminWallet.address}`);
-      return true;
-    } catch (e) {
-      console.error("❌ Admin init failed:", e.message);
-      return false;
-    }
-  }
+ 
 
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
