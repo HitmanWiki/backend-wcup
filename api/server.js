@@ -46,11 +46,8 @@ const query = async (text, params) => {
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
 async function initDatabase() {
-  // Drop existing table to ensure clean schema
-  await query(`DROP TABLE IF EXISTS matches CASCADE;`).catch(() => {});
-  
   await query(`
-    CREATE TABLE matches (
+    CREATE TABLE IF NOT EXISTS matches (
       id               INTEGER   PRIMARY KEY,
       home_team        TEXT      NOT NULL,
       away_team        TEXT      NOT NULL,
@@ -123,40 +120,40 @@ async function initDatabase() {
       expires_at TIMESTAMP NOT NULL
     );
   `);
-  
+
+  // ─── Admin Wallet & Contract ────────────────────────────────────────────────
+  let adminWallet = null;
+  let bettingContract = null;
+
+  function initAdmin() {
+    if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
+      console.log("⚠️ Admin not configured - contract automation disabled");
+      return false;
+    }
+    try {
+      const provider = new ethers.JsonRpcProvider(RPC_URL);
+      adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+      bettingContract = new ethers.Contract(BETTING_ADDRESS, [
+        "function createMatch(string,string,uint256,uint256) returns (uint256)",
+        "function settleMatch(uint256,uint8)",
+        "function settleUltimate(string)",
+        "function matchCount() view returns (uint256)",
+        "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
+        "function ultimateSettled() view returns (bool)"
+      ], adminWallet);
+      console.log(`✅ Admin wallet: ${adminWallet.address}`);
+      return true;
+    } catch (e) {
+      console.error("❌ Admin init failed:", e.message);
+      return false;
+    }
+  }
+
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_bets_user ON bets(user_address);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_bets_match ON bets(match_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_ultimate_bets_user ON ultimate_bets(user_address);`);
-
-  // ─── Admin Wallet & Contract ────────────────────────────────────────────────
-let adminWallet = null;
-let bettingContract = null;
-
-function initAdmin() {
-  if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
-    console.log("⚠️ Admin not configured - contract automation disabled");
-    return false;
-  }
-  try {
-    const provider = new ethers.JsonRpcProvider(RPC_URL);
-    adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
-    bettingContract = new ethers.Contract(BETTING_ADDRESS, [
-      "function createMatch(string,string,uint256,uint256) returns (uint256)",
-      "function settleMatch(uint256,uint8)",
-      "function settleUltimate(string)",
-      "function matchCount() view returns (uint256)",
-      "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
-      "function ultimateSettled() view returns (bool)"
-    ], adminWallet);
-    console.log(`✅ Admin wallet: ${adminWallet.address}`);
-    return true;
-  } catch (e) {
-    console.error("❌ Admin init failed:", e.message);
-    return false;
-  }
-}
 
   // Seed betting settings if not exists
   await query(`
@@ -169,7 +166,6 @@ function initAdmin() {
   console.log(`✅ DB ready — ${count} cached matches`);
   return count;
 }
-
 // ─── Complete World Cup 2026 Fixtures (102 matches) ───────────────────────────
 const WC2026_FIXTURES = [
   // GROUP STAGE - 72 matches (12 groups of 3 teams each)
