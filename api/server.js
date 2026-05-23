@@ -840,7 +840,21 @@ app.get("/api/ultimate", async (req, res) => {
     res.json({ deadline: 1784577000, settled: false, winner: null, totalPool: "0", teamPools: [] });
   }
 });
-
+// POST /api/ultimate/update-deadline - Update ultimate deadline
+app.post("/api/ultimate/update-deadline", async (req, res) => {
+  const { deadline } = req.body;
+  if (!deadline) return res.status(400).json({ error: "deadline required" });
+  
+  try {
+    await query(
+      "UPDATE betting_settings SET ultimate_deadline = $1 WHERE id = 1",
+      [deadline]
+    );
+    res.json({ success: true, deadline: deadline });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post("/api/ultimate/settle", async (req, res) => {
   const { winner } = req.body;
   if (!winner) return res.status(400).json({ error: "winner required" });
