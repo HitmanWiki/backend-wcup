@@ -1,6 +1,6 @@
 /**
  * World Cup 2026 Betting — Backend API
- * Complete World Cup 2026 fixture list (102 matches)
+ * Complete World Cup 2026 fixture list (104 matches)
  */
 
 require("dotenv").config();
@@ -20,10 +20,10 @@ const GEMINI_API_KEY      = process.env.GEMINI_API_KEY;
 const DATABASE_URL        = process.env.DATABASE_URL;
 const FOOTBALL_DATA_KEY   = process.env.FOOTBALL_DATA_API_KEY;
 const API_FOOTBALL_KEY    = process.env.API_FOOTBALL_KEY;
-const ADMIN_PRIVATE_KEY = process.env.ADMIN_PRIVATE_KEY || '';
-const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || '';
-const BETTING_ADDRESS = process.env.BETTING_ADDRESS || '';
-const RPC_URL = process.env.RPC_URL || 'https://mainnet.base.org';
+const ADMIN_PRIVATE_KEY   = process.env.ADMIN_PRIVATE_KEY || '';
+const TOKEN_ADDRESS       = process.env.TOKEN_ADDRESS || '';
+const BETTING_ADDRESS     = process.env.BETTING_ADDRESS || '';
+const RPC_URL             = process.env.RPC_URL || 'https://mainnet.base.org';
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
 if (!DATABASE_URL)   { console.error("DATABASE_URL missing");     process.exit(1); }
@@ -44,33 +44,33 @@ const query = async (text, params) => {
   catch (err) { console.error("Query error:", err.message); throw err; }
 };
 
- // ─── Admin Wallet & Contract ────────────────────────────────────────────────
-  let adminWallet = null;
-  let bettingContract = null;
+// ─── Admin Wallet & Contract ─────────────────────────────────────────────────
+let adminWallet = null;
+let bettingContract = null;
 
-  function initAdmin() {
-    if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
-      console.log("⚠️ Admin not configured - contract automation disabled");
-      return false;
-    }
-    try {
-      const provider = new ethers.JsonRpcProvider(RPC_URL);
-      adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
-      bettingContract = new ethers.Contract(BETTING_ADDRESS, [
-        "function createMatch(string,string,uint256,uint256) returns (uint256)",
-        "function settleMatch(uint256,uint8)",
-        "function settleUltimate(string)",
-        "function matchCount() view returns (uint256)",
-        "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
-        "function ultimateSettled() view returns (bool)"
-      ], adminWallet);
-      console.log(`✅ Admin wallet: ${adminWallet.address}`);
-      return true;
-    } catch (e) {
-      console.error("❌ Admin init failed:", e.message);
-      return false;
-    }
+function initAdmin() {
+  if (!ADMIN_PRIVATE_KEY || !BETTING_ADDRESS) {
+    console.log("⚠️ Admin not configured - contract automation disabled");
+    return false;
   }
+  try {
+    const provider = new ethers.JsonRpcProvider(RPC_URL);
+    adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+    bettingContract = new ethers.Contract(BETTING_ADDRESS, [
+      "function createMatch(string,string,uint256,uint256) returns (uint256)",
+      "function settleMatch(uint256,uint8)",
+      "function settleUltimate(string)",
+      "function matchCount() view returns (uint256)",
+      "function getMatch(uint256) view returns (tuple(string,string,uint256,uint256,uint8,bool,uint256,uint256,uint256,uint256))",
+      "function ultimateSettled() view returns (bool)"
+    ], adminWallet);
+    console.log(`✅ Admin wallet: ${adminWallet.address}`);
+    return true;
+  } catch (e) {
+    console.error("❌ Admin init failed:", e.message);
+    return false;
+  }
+}
 
 // ─── DB init ──────────────────────────────────────────────────────────────────
 async function initDatabase() {
@@ -84,7 +84,6 @@ async function initDatabase() {
       home_score       INTEGER   DEFAULT 0,
       away_score       INTEGER   DEFAULT 0,
       winner           TEXT,
-      settled_onchain  BOOLEAN DEFAULT FALSE,
       competition_code TEXT,
       competition_name TEXT,
       group_name       TEXT,
@@ -127,16 +126,7 @@ async function initDatabase() {
       id INTEGER PRIMARY KEY DEFAULT 1,
       ultimate_deadline BIGINT NOT NULL DEFAULT 0,
       ultimate_settled BOOLEAN DEFAULT FALSE,
-      ultimate_winner TEXT,
-      ultimate_settled_onchain BOOLEAN DEFAULT FALSE
-    );
-  `);
-  
-  await query(`
-    CREATE TABLE IF NOT EXISTS cache_metadata (
-      key TEXT PRIMARY KEY, 
-      last_fetched TIMESTAMP, 
-      data_hash TEXT
+      ultimate_winner TEXT
     );
   `);
   
@@ -149,165 +139,177 @@ async function initDatabase() {
     );
   `);
 
- 
-
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_date ON matches(start_time);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_matches_teams ON matches(home_team, away_team);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_bets_user ON bets(user_address);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_bets_match ON bets(match_id);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_ultimate_bets_user ON ultimate_bets(user_address);`);
 
-  // Seed betting settings if not exists
+  // Seed ultimate deadline: July 20, 2026 00:30 UTC
   await query(`
     INSERT INTO betting_settings (id, ultimate_deadline) 
     VALUES (1, $1)
-    ON CONFLICT (id) DO NOTHING
-  `, [Math.floor(Date.now() / 1000) + 2592000]);
+    ON CONFLICT (id) DO UPDATE SET ultimate_deadline = EXCLUDED.ultimate_deadline
+  `, [1753038600]);
 
   const count = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count || "0");
   console.log(`✅ DB ready — ${count} cached matches`);
   return count;
 }
-// ─── Complete World Cup 2026 Fixtures (102 matches) ───────────────────────────
+
+// ─── Official FIFA World Cup 2026 Fixtures (104 matches) ──────────────────────
 const WC2026_FIXTURES = [
-  // GROUP STAGE - 72 matches (12 groups of 3 teams each)
+  // ═══════════════════════════════════════════════════════
+  // GROUP STAGE - 72 Matches
+  // ═══════════════════════════════════════════════════════
+  
   // Group A
-  {id:1, home:"Mexico", away:"South Africa", date:"2026-06-11T19:00:00Z", group:"A", round:"Group Stage", stadium:"Estadio Azteca", city:"Mexico City"},
-  {id:2, home:"Korea Republic", away:"Denmark", date:"2026-06-13T02:00:00Z", group:"A", round:"Group Stage", stadium:"Estadio Akron", city:"Guadalajara"},
-  {id:3, home:"Denmark", away:"South Africa", date:"2026-06-18T02:00:00Z", group:"A", round:"Group Stage", stadium:"Estadio Akron", city:"Guadalajara"},
-  {id:4, home:"Mexico", away:"Korea Republic", date:"2026-06-21T22:00:00Z", group:"A", round:"Group Stage", stadium:"Estadio Akron", city:"Guadalajara"},
-  {id:5, home:"South Africa", away:"Korea Republic", date:"2026-06-27T19:00:00Z", group:"A", round:"Group Stage", stadium:"Estadio Akron", city:"Guadalajara"},
-  {id:6, home:"Denmark", away:"Mexico", date:"2026-06-28T01:00:00Z", group:"A", round:"Group Stage", stadium:"Estadio Azteca", city:"Mexico City"},
+  {id:1, home:"Mexico", away:"South Africa", date:"2026-06-12T00:30:00Z", group:"A", round:"Group Stage", stadium:"Mexico City Stadium", city:"Mexico City"},
+  {id:2, home:"Korea Republic", away:"Czechia", date:"2026-06-12T07:30:00Z", group:"A", round:"Group Stage", stadium:"Guadalajara Stadium", city:"Guadalajara"},
+  {id:3, home:"Czechia", away:"South Africa", date:"2026-06-18T21:30:00Z", group:"A", round:"Group Stage", stadium:"Atlanta Stadium", city:"Atlanta"},
+  {id:4, home:"Mexico", away:"Korea Republic", date:"2026-06-19T06:30:00Z", group:"A", round:"Group Stage", stadium:"Guadalajara Stadium", city:"Guadalajara"},
+  {id:5, home:"Czechia", away:"Mexico", date:"2026-06-25T06:30:00Z", group:"A", round:"Group Stage", stadium:"Mexico City Stadium", city:"Mexico City"},
+  {id:6, home:"South Africa", away:"Korea Republic", date:"2026-06-25T06:30:00Z", group:"A", round:"Group Stage", stadium:"Monterrey Stadium", city:"Monterrey"},
   
   // Group B
-  {id:7, home:"USA", away:"Switzerland", date:"2026-06-12T19:00:00Z", group:"B", round:"Group Stage", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:8, home:"Italy", away:"Qatar", date:"2026-06-13T19:00:00Z", group:"B", round:"Group Stage", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:9, home:"Switzerland", away:"Qatar", date:"2026-06-15T01:00:00Z", group:"B", round:"Group Stage", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:10, home:"USA", away:"Italy", date:"2026-06-21T19:00:00Z", group:"B", round:"Group Stage", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:11, home:"Qatar", away:"USA", date:"2026-06-22T02:00:00Z", group:"B", round:"Group Stage", stadium:"BMO Field", city:"Toronto"},
-  {id:12, home:"Switzerland", away:"Italy", date:"2026-06-27T03:00:00Z", group:"B", round:"Group Stage", stadium:"BMO Field", city:"Toronto"},
+  {id:7, home:"Canada", away:"Bosnia and Herzegovina", date:"2026-06-13T00:30:00Z", group:"B", round:"Group Stage", stadium:"Toronto Stadium", city:"Toronto"},
+  {id:8, home:"Qatar", away:"Switzerland", date:"2026-06-14T00:30:00Z", group:"B", round:"Group Stage", stadium:"San Francisco Bay Area Stadium", city:"San Francisco Bay Area"},
+  {id:9, home:"Switzerland", away:"Bosnia and Herzegovina", date:"2026-06-19T00:30:00Z", group:"B", round:"Group Stage", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:10, home:"Canada", away:"Qatar", date:"2026-06-19T03:30:00Z", group:"B", round:"Group Stage", stadium:"BC Place Vancouver", city:"Vancouver"},
+  {id:11, home:"Switzerland", away:"Canada", date:"2026-06-25T00:30:00Z", group:"B", round:"Group Stage", stadium:"BC Place Vancouver", city:"Vancouver"},
+  {id:12, home:"Bosnia and Herzegovina", away:"Qatar", date:"2026-06-25T00:30:00Z", group:"B", round:"Group Stage", stadium:"Seattle Stadium", city:"Seattle"},
   
   // Group C
-  {id:13, home:"Brazil", away:"Morocco", date:"2026-06-14T01:00:00Z", group:"C", round:"Group Stage", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:14, home:"Haiti", away:"Scotland", date:"2026-06-14T22:00:00Z", group:"C", round:"Group Stage", stadium:"BMO Field", city:"Toronto"},
-  {id:15, home:"Morocco", away:"Scotland", date:"2026-06-18T01:00:00Z", group:"C", round:"Group Stage", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:16, home:"Brazil", away:"Haiti", date:"2026-06-22T01:00:00Z", group:"C", round:"Group Stage", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:17, home:"Scotland", away:"Brazil", date:"2026-06-26T22:00:00Z", group:"C", round:"Group Stage", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:18, home:"Morocco", away:"Haiti", date:"2026-06-25T17:00:00Z", group:"C", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
+  {id:13, home:"Brazil", away:"Morocco", date:"2026-06-14T03:30:00Z", group:"C", round:"Group Stage", stadium:"New York/New Jersey Stadium", city:"New York"},
+  {id:14, home:"Haiti", away:"Scotland", date:"2026-06-14T06:30:00Z", group:"C", round:"Group Stage", stadium:"Boston Stadium", city:"Boston"},
+  {id:15, home:"Scotland", away:"Morocco", date:"2026-06-20T03:30:00Z", group:"C", round:"Group Stage", stadium:"Boston Stadium", city:"Boston"},
+  {id:16, home:"Brazil", away:"Haiti", date:"2026-06-20T06:00:00Z", group:"C", round:"Group Stage", stadium:"Philadelphia Stadium", city:"Philadelphia"},
+  {id:17, home:"Scotland", away:"Brazil", date:"2026-06-25T03:30:00Z", group:"C", round:"Group Stage", stadium:"Miami Stadium", city:"Miami"},
+  {id:18, home:"Morocco", away:"Haiti", date:"2026-06-25T03:30:00Z", group:"C", round:"Group Stage", stadium:"Atlanta Stadium", city:"Atlanta"},
   
   // Group D
-  {id:19, home:"Australia", away:"Paraguay", date:"2026-06-13T04:00:00Z", group:"D", round:"Group Stage", stadium:"BC Place", city:"Vancouver"},
-  {id:20, home:"USA", away:"Australia", date:"2026-06-20T22:00:00Z", group:"D", round:"Group Stage", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:21, home:"Paraguay", away:"USA", date:"2026-06-27T23:00:00Z", group:"D", round:"Group Stage", stadium:"Arrowhead Stadium", city:"Kansas City"},
-  {id:22, home:"Australia", away:"USA", date:"2026-06-28T02:00:00Z", group:"D", round:"Group Stage", stadium:"Lumen Field", city:"Seattle"},
+  {id:19, home:"USA", away:"Paraguay", date:"2026-06-13T06:30:00Z", group:"D", round:"Group Stage", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:20, home:"Australia", away:"Türkiye", date:"2026-06-14T09:30:00Z", group:"D", round:"Group Stage", stadium:"BC Place Vancouver", city:"Vancouver"},
+  {id:21, home:"USA", away:"Australia", date:"2026-06-20T00:30:00Z", group:"D", round:"Group Stage", stadium:"Seattle Stadium", city:"Seattle"},
+  {id:22, home:"Türkiye", away:"Paraguay", date:"2026-06-20T08:30:00Z", group:"D", round:"Group Stage", stadium:"San Francisco Bay Area Stadium", city:"San Francisco Bay Area"},
+  {id:23, home:"Türkiye", away:"USA", date:"2026-06-26T07:30:00Z", group:"D", round:"Group Stage", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:24, home:"Paraguay", away:"Australia", date:"2026-06-26T07:30:00Z", group:"D", round:"Group Stage", stadium:"San Francisco Bay Area Stadium", city:"San Francisco Bay Area"},
   
   // Group E
-  {id:23, home:"Germany", away:"Curacao", date:"2026-06-14T19:00:00Z", group:"E", round:"Group Stage", stadium:"NRG Stadium", city:"Houston"},
-  {id:24, home:"Ivory Coast", away:"Ecuador", date:"2026-06-14T20:00:00Z", group:"E", round:"Group Stage", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:25, home:"Ecuador", away:"Curacao", date:"2026-06-22T04:00:00Z", group:"E", round:"Group Stage", stadium:"NRG Stadium", city:"Houston"},
-  {id:26, home:"Germany", away:"Ivory Coast", date:"2026-06-23T00:00:00Z", group:"E", round:"Group Stage", stadium:"NRG Stadium", city:"Houston"},
-  {id:27, home:"Ecuador", away:"Germany", date:"2026-06-26T22:00:00Z", group:"E", round:"Group Stage", stadium:"Arrowhead Stadium", city:"Kansas City"},
-  {id:28, home:"Curacao", away:"Ivory Coast", date:"2026-06-27T20:00:00Z", group:"E", round:"Group Stage", stadium:"AT&T Stadium", city:"Dallas"},
+  {id:25, home:"Germany", away:"Curaçao", date:"2026-06-14T22:30:00Z", group:"E", round:"Group Stage", stadium:"Houston Stadium", city:"Houston"},
+  {id:26, home:"Côte d'Ivoire", away:"Ecuador", date:"2026-06-15T04:30:00Z", group:"E", round:"Group Stage", stadium:"Philadelphia Stadium", city:"Philadelphia"},
+  {id:27, home:"Germany", away:"Côte d'Ivoire", date:"2026-06-21T01:30:00Z", group:"E", round:"Group Stage", stadium:"Toronto Stadium", city:"Toronto"},
+  {id:28, home:"Ecuador", away:"Curaçao", date:"2026-06-21T05:30:00Z", group:"E", round:"Group Stage", stadium:"Kansas City Stadium", city:"Kansas City"},
+  {id:29, home:"Curaçao", away:"Côte d'Ivoire", date:"2026-06-26T01:30:00Z", group:"E", round:"Group Stage", stadium:"Philadelphia Stadium", city:"Philadelphia"},
+  {id:30, home:"Ecuador", away:"Germany", date:"2026-06-26T01:30:00Z", group:"E", round:"Group Stage", stadium:"New York/New Jersey Stadium", city:"New York"},
   
   // Group F
-  {id:29, home:"Netherlands", away:"Japan", date:"2026-06-15T17:00:00Z", group:"F", round:"Group Stage", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:30, home:"Tunisia", away:"Poland", date:"2026-06-16T02:00:00Z", group:"F", round:"Group Stage", stadium:"BC Place", city:"Vancouver"},
-  {id:31, home:"Japan", away:"Poland", date:"2026-06-22T19:00:00Z", group:"F", round:"Group Stage", stadium:"Estadio BBVA", city:"Monterrey"},
-  {id:32, home:"Netherlands", away:"Tunisia", date:"2026-06-22T17:00:00Z", group:"F", round:"Group Stage", stadium:"NRG Stadium", city:"Houston"},
-  {id:33, home:"Poland", away:"Netherlands", date:"2026-06-27T20:00:00Z", group:"F", round:"Group Stage", stadium:"Estadio BBVA", city:"Monterrey"},
-  {id:34, home:"Japan", away:"Tunisia", date:"2026-06-28T19:00:00Z", group:"F", round:"Group Stage", stadium:"Lumen Field", city:"Seattle"},
+  {id:31, home:"Netherlands", away:"Japan", date:"2026-06-15T01:30:00Z", group:"F", round:"Group Stage", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:32, home:"Sweden", away:"Tunisia", date:"2026-06-15T07:30:00Z", group:"F", round:"Group Stage", stadium:"Monterrey Stadium", city:"Monterrey"},
+  {id:33, home:"Netherlands", away:"Sweden", date:"2026-06-20T22:30:00Z", group:"F", round:"Group Stage", stadium:"Houston Stadium", city:"Houston"},
+  {id:34, home:"Tunisia", away:"Japan", date:"2026-06-21T09:30:00Z", group:"F", round:"Group Stage", stadium:"Monterrey Stadium", city:"Monterrey"},
+  {id:35, home:"Japan", away:"Sweden", date:"2026-06-26T04:30:00Z", group:"F", round:"Group Stage", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:36, home:"Tunisia", away:"Netherlands", date:"2026-06-26T04:30:00Z", group:"F", round:"Group Stage", stadium:"Kansas City Stadium", city:"Kansas City"},
   
   // Group G
-  {id:35, home:"Belgium", away:"Egypt", date:"2026-06-15T19:00:00Z", group:"G", round:"Group Stage", stadium:"BC Place", city:"Vancouver"},
-  {id:36, home:"Iran", away:"New Zealand", date:"2026-06-16T01:00:00Z", group:"G", round:"Group Stage", stadium:"Lumen Field", city:"Seattle"},
-  {id:37, home:"Egypt", away:"New Zealand", date:"2026-06-23T19:00:00Z", group:"G", round:"Group Stage", stadium:"BC Place", city:"Vancouver"},
-  {id:38, home:"Belgium", away:"Iran", date:"2026-06-23T17:00:00Z", group:"G", round:"Group Stage", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:39, home:"New Zealand", away:"Belgium", date:"2026-06-29T02:00:00Z", group:"G", round:"Group Stage", stadium:"Lumen Field", city:"Seattle"},
-  {id:40, home:"Egypt", away:"Iran", date:"2026-06-29T02:00:00Z", group:"G", round:"Group Stage", stadium:"SoFi Stadium", city:"Los Angeles"},
+  {id:37, home:"Belgium", away:"Egypt", date:"2026-06-16T00:30:00Z", group:"G", round:"Group Stage", stadium:"Seattle Stadium", city:"Seattle"},
+  {id:38, home:"IR Iran", away:"New Zealand", date:"2026-06-16T06:30:00Z", group:"G", round:"Group Stage", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:39, home:"Belgium", away:"IR Iran", date:"2026-06-22T00:30:00Z", group:"G", round:"Group Stage", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:40, home:"New Zealand", away:"Egypt", date:"2026-06-22T06:30:00Z", group:"G", round:"Group Stage", stadium:"BC Place Vancouver", city:"Vancouver"},
+  {id:41, home:"Egypt", away:"IR Iran", date:"2026-06-27T08:30:00Z", group:"G", round:"Group Stage", stadium:"Seattle Stadium", city:"Seattle"},
+  {id:42, home:"New Zealand", away:"Belgium", date:"2026-06-27T08:30:00Z", group:"G", round:"Group Stage", stadium:"BC Place Vancouver", city:"Vancouver"},
   
   // Group H
-  {id:41, home:"Spain", away:"Cape Verde", date:"2026-06-15T22:00:00Z", group:"H", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
-  {id:42, home:"Saudi Arabia", away:"Uruguay", date:"2026-06-14T23:00:00Z", group:"H", round:"Group Stage", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:43, home:"Uruguay", away:"Cape Verde", date:"2026-06-24T23:00:00Z", group:"H", round:"Group Stage", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:44, home:"Spain", away:"Saudi Arabia", date:"2026-06-22T22:00:00Z", group:"H", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
-  {id:45, home:"Cape Verde", away:"Saudi Arabia", date:"2026-06-29T03:00:00Z", group:"H", round:"Group Stage", stadium:"Arrowhead Stadium", city:"Kansas City"},
-  {id:46, home:"Uruguay", away:"Spain", date:"2026-06-30T00:00:00Z", group:"H", round:"Group Stage", stadium:"Arrowhead Stadium", city:"Kansas City"},
+  {id:43, home:"Spain", away:"Cabo Verde", date:"2026-06-15T21:30:00Z", group:"H", round:"Group Stage", stadium:"Atlanta Stadium", city:"Atlanta"},
+  {id:44, home:"Saudi Arabia", away:"Uruguay", date:"2026-06-16T03:30:00Z", group:"H", round:"Group Stage", stadium:"Miami Stadium", city:"Miami"},
+  {id:45, home:"Spain", away:"Saudi Arabia", date:"2026-06-21T21:30:00Z", group:"H", round:"Group Stage", stadium:"Atlanta Stadium", city:"Atlanta"},
+  {id:46, home:"Uruguay", away:"Cabo Verde", date:"2026-06-22T03:30:00Z", group:"H", round:"Group Stage", stadium:"Miami Stadium", city:"Miami"},
+  {id:47, home:"Cabo Verde", away:"Saudi Arabia", date:"2026-06-27T05:30:00Z", group:"H", round:"Group Stage", stadium:"Houston Stadium", city:"Houston"},
+  {id:48, home:"Uruguay", away:"Spain", date:"2026-06-27T05:30:00Z", group:"H", round:"Group Stage", stadium:"Guadalajara Stadium", city:"Guadalajara"},
   
   // Group I
-  {id:47, home:"France", away:"Senegal", date:"2026-06-18T01:00:00Z", group:"I", round:"Group Stage", stadium:"BMO Field", city:"Toronto"},
-  {id:48, home:"Norway", away:"Croatia", date:"2026-06-16T22:00:00Z", group:"I", round:"Group Stage", stadium:"NRG Stadium", city:"Houston"},
-  {id:49, home:"Senegal", away:"Croatia", date:"2026-06-22T20:00:00Z", group:"I", round:"Group Stage", stadium:"Gillette Stadium", city:"Boston"},
-  {id:50, home:"France", away:"Norway", date:"2026-06-24T21:00:00Z", group:"I", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
-  {id:51, home:"Croatia", away:"France", date:"2026-06-26T02:00:00Z", group:"I", round:"Group Stage", stadium:"Lincoln Financial Field", city:"Philadelphia"},
-  {id:52, home:"Senegal", away:"Norway", date:"2026-06-30T00:00:00Z", group:"I", round:"Group Stage", stadium:"Gillette Stadium", city:"Boston"},
+  {id:49, home:"France", away:"Senegal", date:"2026-06-17T00:30:00Z", group:"I", round:"Group Stage", stadium:"New York/New Jersey Stadium", city:"New York"},
+  {id:50, home:"Iraq", away:"Norway", date:"2026-06-17T03:30:00Z", group:"I", round:"Group Stage", stadium:"Boston Stadium", city:"Boston"},
+  {id:51, home:"France", away:"Iraq", date:"2026-06-23T02:30:00Z", group:"I", round:"Group Stage", stadium:"Philadelphia Stadium", city:"Philadelphia"},
+  {id:52, home:"Norway", away:"Senegal", date:"2026-06-23T05:30:00Z", group:"I", round:"Group Stage", stadium:"New York/New Jersey Stadium", city:"New York"},
+  {id:53, home:"Norway", away:"France", date:"2026-06-27T00:30:00Z", group:"I", round:"Group Stage", stadium:"Boston Stadium", city:"Boston"},
+  {id:54, home:"Senegal", away:"Iraq", date:"2026-06-27T00:30:00Z", group:"I", round:"Group Stage", stadium:"Toronto Stadium", city:"Toronto"},
   
   // Group J
-  {id:53, home:"Argentina", away:"Algeria", date:"2026-06-16T04:00:00Z", group:"J", round:"Group Stage", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:54, home:"Austria", away:"Jordan", date:"2026-06-15T16:00:00Z", group:"J", round:"Group Stage", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:55, home:"Algeria", away:"Jordan", date:"2026-06-24T01:00:00Z", group:"J", round:"Group Stage", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:56, home:"Argentina", away:"Austria", date:"2026-06-23T16:00:00Z", group:"J", round:"Group Stage", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:57, home:"Jordan", away:"Argentina", date:"2026-06-30T02:00:00Z", group:"J", round:"Group Stage", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:58, home:"Algeria", away:"Austria", date:"2026-06-29T23:30:00Z", group:"J", round:"Group Stage", stadium:"Arrowhead Stadium", city:"Kansas City"},
+  {id:55, home:"Argentina", away:"Algeria", date:"2026-06-17T06:30:00Z", group:"J", round:"Group Stage", stadium:"Kansas City Stadium", city:"Kansas City"},
+  {id:56, home:"Austria", away:"Jordan", date:"2026-06-17T09:30:00Z", group:"J", round:"Group Stage", stadium:"San Francisco Bay Area Stadium", city:"San Francisco Bay Area"},
+  {id:57, home:"Argentina", away:"Austria", date:"2026-06-22T22:30:00Z", group:"J", round:"Group Stage", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:58, home:"Jordan", away:"Algeria", date:"2026-06-23T08:30:00Z", group:"J", round:"Group Stage", stadium:"San Francisco Bay Area Stadium", city:"San Francisco Bay Area"},
+  {id:59, home:"Algeria", away:"Austria", date:"2026-06-28T07:30:00Z", group:"J", round:"Group Stage", stadium:"Kansas City Stadium", city:"Kansas City"},
+  {id:60, home:"Jordan", away:"Argentina", date:"2026-06-28T07:30:00Z", group:"J", round:"Group Stage", stadium:"Dallas Stadium", city:"Dallas"},
   
   // Group K
-  {id:59, home:"Uzbekistan", away:"Colombia", date:"2026-06-18T20:00:00Z", group:"K", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
-  {id:60, home:"Portugal", away:"Jamaica", date:"2026-06-19T17:00:00Z", group:"K", round:"Group Stage", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:61, home:"Colombia", away:"Jamaica", date:"2026-06-24T17:00:00Z", group:"K", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
-  {id:62, home:"Portugal", away:"Uzbekistan", date:"2026-06-28T01:00:00Z", group:"K", round:"Group Stage", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:63, home:"Colombia", away:"Portugal", date:"2026-06-29T21:00:00Z", group:"K", round:"Group Stage", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:64, home:"Jamaica", away:"Uzbekistan", date:"2026-06-29T23:30:00Z", group:"K", round:"Group Stage", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
+  {id:61, home:"Portugal", away:"Congo DR", date:"2026-06-17T22:30:00Z", group:"K", round:"Group Stage", stadium:"Houston Stadium", city:"Houston"},
+  {id:62, home:"Uzbekistan", away:"Colombia", date:"2026-06-18T07:30:00Z", group:"K", round:"Group Stage", stadium:"Mexico City Stadium", city:"Mexico City"},
+  {id:63, home:"Portugal", away:"Uzbekistan", date:"2026-06-23T22:30:00Z", group:"K", round:"Group Stage", stadium:"Houston Stadium", city:"Houston"},
+  {id:64, home:"Colombia", away:"Congo DR", date:"2026-06-24T07:30:00Z", group:"K", round:"Group Stage", stadium:"Guadalajara Stadium", city:"Guadalajara"},
+  {id:65, home:"Colombia", away:"Portugal", date:"2026-06-28T05:00:00Z", group:"K", round:"Group Stage", stadium:"Miami Stadium", city:"Miami"},
+  {id:66, home:"Congo DR", away:"Uzbekistan", date:"2026-06-28T05:00:00Z", group:"K", round:"Group Stage", stadium:"Atlanta Stadium", city:"Atlanta"},
   
   // Group L
-  {id:65, home:"England", away:"Croatia", date:"2026-06-17T23:00:00Z", group:"L", round:"Group Stage", stadium:"BMO Field", city:"Toronto"},
-  {id:66, home:"Ghana", away:"Panama", date:"2026-06-16T19:00:00Z", group:"L", round:"Group Stage", stadium:"BMO Field", city:"Toronto"},
-  {id:67, home:"Croatia", away:"Panama", date:"2026-06-24T20:00:00Z", group:"L", round:"Group Stage", stadium:"Gillette Stadium", city:"Boston"},
-  {id:68, home:"England", away:"Ghana", date:"2026-06-25T00:00:00Z", group:"L", round:"Group Stage", stadium:"Gillette Stadium", city:"Boston"},
-  {id:69, home:"Panama", away:"England", date:"2026-06-28T19:00:00Z", group:"L", round:"Group Stage", stadium:"Gillette Stadium", city:"Boston"},
-  {id:70, home:"Croatia", away:"Ghana", date:"2026-06-28T21:00:00Z", group:"L", round:"Group Stage", stadium:"Gillette Stadium", city:"Boston"},
+  {id:67, home:"England", away:"Croatia", date:"2026-06-18T01:30:00Z", group:"L", round:"Group Stage", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:68, home:"Ghana", away:"Panama", date:"2026-06-18T04:30:00Z", group:"L", round:"Group Stage", stadium:"Toronto Stadium", city:"Toronto"},
+  {id:69, home:"England", away:"Ghana", date:"2026-06-24T01:30:00Z", group:"L", round:"Group Stage", stadium:"Boston Stadium", city:"Boston"},
+  {id:70, home:"Panama", away:"Croatia", date:"2026-06-24T04:30:00Z", group:"L", round:"Group Stage", stadium:"Toronto Stadium", city:"Toronto"},
+  {id:71, home:"Panama", away:"England", date:"2026-06-28T02:30:00Z", group:"L", round:"Group Stage", stadium:"New York/New Jersey Stadium", city:"New York"},
+  {id:72, home:"Croatia", away:"Ghana", date:"2026-06-28T02:30:00Z", group:"L", round:"Group Stage", stadium:"Philadelphia Stadium", city:"Philadelphia"},
   
-  // ROUND OF 32 (16 matches)
-  {id:71, home:"1A", away:"3B", date:"2026-07-01T19:00:00Z", round:"Round of 32", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:72, home:"1C", away:"3D", date:"2026-07-01T20:30:00Z", round:"Round of 32", stadium:"NRG Stadium", city:"Houston"},
-  {id:73, home:"1E", away:"3F", date:"2026-07-02T01:00:00Z", round:"Round of 32", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:74, home:"1G", away:"3H", date:"2026-07-02T17:00:00Z", round:"Round of 32", stadium:"Lumen Field", city:"Seattle"},
-  {id:75, home:"1I", away:"3J", date:"2026-07-02T21:00:00Z", round:"Round of 32", stadium:"MetLife Stadium", city:"New York"},
-  {id:76, home:"1K", away:"3L", date:"2026-07-02T17:00:00Z", round:"Round of 32", stadium:"Lincoln Financial Field", city:"Philadelphia"},
-  {id:77, home:"1B", away:"3A", date:"2026-07-03T01:00:00Z", round:"Round of 32", stadium:"Estadio Azteca", city:"Mexico City"},
-  {id:78, home:"1D", away:"3C", date:"2026-07-03T16:00:00Z", round:"Round of 32", stadium:"Levi's Stadium", city:"San Francisco"},
-  {id:79, home:"1F", away:"3E", date:"2026-07-04T00:00:00Z", round:"Round of 32", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
-  {id:80, home:"1H", away:"3G", date:"2026-07-03T20:00:00Z", round:"Round of 32", stadium:"Lumen Field", city:"Seattle"},
-  {id:81, home:"1J", away:"3I", date:"2026-07-04T23:00:00Z", round:"Round of 32", stadium:"Arrowhead Stadium", city:"Kansas City"},
-  {id:82, home:"1L", away:"3K", date:"2026-07-04T19:00:00Z", round:"Round of 32", stadium:"Hard Rock Stadium", city:"Miami"},
-  {id:83, home:"2A", away:"2B", date:"2026-07-05T03:00:00Z", round:"Round of 32", stadium:"MetLife Stadium", city:"New York"},
-  {id:84, home:"2C", away:"2D", date:"2026-07-05T22:00:00Z", round:"Round of 32", stadium:"BC Place", city:"Vancouver"},
-  {id:85, home:"2E", away:"2F", date:"2026-07-06T01:30:00Z", round:"Round of 32", stadium:"Estadio Azteca", city:"Mexico City"},
-  {id:86, home:"2G", away:"2H", date:"2026-07-05T18:00:00Z", round:"Round of 32", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
+  // ═══════════════════════════════════════════════════════
+  // ROUND OF 32 - 16 Matches
+  // ═══════════════════════════════════════════════════════
+  {id:73, home:"2A", away:"2B", date:"2026-06-29T00:30:00Z", round:"Round of 32", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:74, home:"1C", away:"2F", date:"2026-06-29T22:30:00Z", round:"Round of 32", stadium:"Houston Stadium", city:"Houston"},
+  {id:75, home:"1E", away:"3ABCDF", date:"2026-06-30T02:00:00Z", round:"Round of 32", stadium:"Boston Stadium", city:"Boston"},
+  {id:76, home:"1F", away:"2C", date:"2026-06-30T06:30:00Z", round:"Round of 32", stadium:"Monterrey Stadium", city:"Monterrey"},
+  {id:77, home:"2E", away:"2I", date:"2026-06-30T22:30:00Z", round:"Round of 32", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:78, home:"1I", away:"3CDFGH", date:"2026-07-01T02:30:00Z", round:"Round of 32", stadium:"New York/New Jersey Stadium", city:"New York"},
+  {id:79, home:"1A", away:"3CEFHI", date:"2026-07-01T06:30:00Z", round:"Round of 32", stadium:"Mexico City Stadium", city:"Mexico City"},
+  {id:80, home:"1L", away:"3EHIJK", date:"2026-07-01T21:30:00Z", round:"Round of 32", stadium:"Atlanta Stadium", city:"Atlanta"},
+  {id:81, home:"1G", away:"3AEHIJ", date:"2026-07-02T01:30:00Z", round:"Round of 32", stadium:"Seattle Stadium", city:"Seattle"},
+  {id:82, home:"1D", away:"3BEFIJ", date:"2026-07-02T05:30:00Z", round:"Round of 32", stadium:"San Francisco Bay Area Stadium", city:"San Francisco Bay Area"},
+  {id:83, home:"1H", away:"2J", date:"2026-07-03T00:30:00Z", round:"Round of 32", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:84, home:"2K", away:"2L", date:"2026-07-03T04:30:00Z", round:"Round of 32", stadium:"Toronto Stadium", city:"Toronto"},
+  {id:85, home:"1B", away:"3EFGIJ", date:"2026-07-03T08:30:00Z", round:"Round of 32", stadium:"BC Place Vancouver", city:"Vancouver"},
+  {id:86, home:"2D", away:"2G", date:"2026-07-03T23:30:00Z", round:"Round of 32", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:87, home:"1J", away:"2H", date:"2026-07-04T03:30:00Z", round:"Round of 32", stadium:"Miami Stadium", city:"Miami"},
+  {id:88, home:"1K", away:"3DEIJL", date:"2026-07-04T07:00:00Z", round:"Round of 32", stadium:"Kansas City Stadium", city:"Kansas City"},
   
-  // ROUND OF 16 (8 matches)
-  {id:87, home:"W71", away:"W72", date:"2026-07-08T17:00:00Z", round:"Round of 16", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:88, home:"W73", away:"W74", date:"2026-07-08T21:00:00Z", round:"Round of 16", stadium:"NRG Stadium", city:"Houston"},
-  {id:89, home:"W75", away:"W76", date:"2026-07-09T20:00:00Z", round:"Round of 16", stadium:"Lincoln Financial Field", city:"Philadelphia"},
-  {id:90, home:"W77", away:"W78", date:"2026-07-10T00:00:00Z", round:"Round of 16", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:91, home:"W79", away:"W80", date:"2026-07-10T19:00:00Z", round:"Round of 16", stadium:"Arrowhead Stadium", city:"Kansas City"},
-  {id:92, home:"W81", away:"W82", date:"2026-07-11T00:00:00Z", round:"Round of 16", stadium:"Lumen Field", city:"Seattle"},
-  {id:93, home:"W83", away:"W84", date:"2026-07-11T16:00:00Z", round:"Round of 16", stadium:"BC Place", city:"Vancouver"},
-  {id:94, home:"W85", away:"W86", date:"2026-07-11T20:00:00Z", round:"Round of 16", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
+  // ═══════════════════════════════════════════════════════
+  // ROUND OF 16 - 8 Matches
+  // ═══════════════════════════════════════════════════════
+  {id:89, home:"W73", away:"W75", date:"2026-07-04T22:30:00Z", round:"Round of 16", stadium:"Houston Stadium", city:"Houston"},
+  {id:90, home:"W74", away:"W77", date:"2026-07-05T02:30:00Z", round:"Round of 16", stadium:"Philadelphia Stadium", city:"Philadelphia"},
+  {id:91, home:"W76", away:"W78", date:"2026-07-06T01:30:00Z", round:"Round of 16", stadium:"New York/New Jersey Stadium", city:"New York"},
+  {id:92, home:"W79", away:"W80", date:"2026-07-06T05:30:00Z", round:"Round of 16", stadium:"Mexico City Stadium", city:"Mexico City"},
+  {id:93, home:"W83", away:"W84", date:"2026-07-07T00:30:00Z", round:"Round of 16", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:94, home:"W81", away:"W82", date:"2026-07-07T05:30:00Z", round:"Round of 16", stadium:"Seattle Stadium", city:"Seattle"},
+  {id:95, home:"W86", away:"W88", date:"2026-07-07T21:30:00Z", round:"Round of 16", stadium:"Atlanta Stadium", city:"Atlanta"},
+  {id:96, home:"W85", away:"W87", date:"2026-07-08T01:30:00Z", round:"Round of 16", stadium:"BC Place Vancouver", city:"Vancouver"},
   
-  // QUARTER FINALS (4 matches)
-  {id:95, home:"W87", away:"W88", date:"2026-07-15T20:00:00Z", round:"Quarter Final", stadium:"MetLife Stadium", city:"New York"},
-  {id:96, home:"W89", away:"W90", date:"2026-07-16T00:00:00Z", round:"Quarter Final", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:97, home:"W91", away:"W92", date:"2026-07-16T21:00:00Z", round:"Quarter Final", stadium:"SoFi Stadium", city:"Los Angeles"},
-  {id:98, home:"W93", away:"W94", date:"2026-07-17T01:00:00Z", round:"Quarter Final", stadium:"Mercedes-Benz Stadium", city:"Atlanta"},
+  // ═══════════════════════════════════════════════════════
+  // QUARTER-FINALS - 4 Matches
+  // ═══════════════════════════════════════════════════════
+  {id:97, home:"W89", away:"W90", date:"2026-07-10T01:30:00Z", round:"Quarter-final", stadium:"Boston Stadium", city:"Boston"},
+  {id:98, home:"W93", away:"W94", date:"2026-07-11T00:30:00Z", round:"Quarter-final", stadium:"Los Angeles Stadium", city:"Los Angeles"},
+  {id:99, home:"W91", away:"W92", date:"2026-07-12T02:30:00Z", round:"Quarter-final", stadium:"Miami Stadium", city:"Miami"},
+  {id:100, home:"W95", away:"W96", date:"2026-07-12T06:30:00Z", round:"Quarter-final", stadium:"Kansas City Stadium", city:"Kansas City"},
   
-  // SEMI FINALS (2 matches)
-  {id:99, home:"W95", away:"W96", date:"2026-07-19T19:00:00Z", round:"Semi Final", stadium:"AT&T Stadium", city:"Dallas"},
-  {id:100, home:"W97", away:"W98", date:"2026-07-19T19:00:00Z", round:"Semi Final", stadium:"MetLife Stadium", city:"New York"},
+  // ═══════════════════════════════════════════════════════
+  // SEMI-FINALS - 2 Matches
+  // ═══════════════════════════════════════════════════════
+  {id:101, home:"W97", away:"W98", date:"2026-07-15T00:30:00Z", round:"Semi-final", stadium:"Dallas Stadium", city:"Dallas"},
+  {id:102, home:"W99", away:"W100", date:"2026-07-16T00:30:00Z", round:"Semi-final", stadium:"Atlanta Stadium", city:"Atlanta"},
   
-  // THIRD PLACE (1 match)
-  {id:101, home:"L99", away:"L100", date:"2026-07-25T21:00:00Z", round:"Third Place", stadium:"Hard Rock Stadium", city:"Miami"},
-  
-  // FINAL (1 match)
-  {id:102, home:"W99", away:"W100", date:"2026-07-26T19:00:00Z", round:"Final", stadium:"MetLife Stadium", city:"New York"}
+  // ═══════════════════════════════════════════════════════
+  // THIRD PLACE & FINAL
+  // ═══════════════════════════════════════════════════════
+  {id:103, home:"RU101", away:"RU102", date:"2026-07-19T02:30:00Z", round:"Third Place", stadium:"Miami Stadium", city:"Miami"},
+  {id:104, home:"W101", away:"W102", date:"2026-07-20T00:30:00Z", round:"Final", stadium:"New York/New Jersey Stadium", city:"New York"}
 ];
 
 async function fetchAndCacheMatches() {
@@ -338,31 +340,18 @@ async function fetchAndCacheMatches() {
     }
   }
 
-  await query(
-    `INSERT INTO cache_metadata (key, last_fetched, data_hash)
-     VALUES ('matches', NOW(), $1)
-     ON CONFLICT (key) DO UPDATE SET last_fetched = NOW(), data_hash = EXCLUDED.data_hash`,
-    [String(stored)]
-  );
-  
-  console.log(`✅ Stored ${stored}/102 World Cup matches in DB`);
+  console.log(`✅ Stored ${stored}/104 World Cup matches in DB`);
   return stored;
 }
 
 // ─── Match Results Fetching ──────────────────────────────────────────────────
 
-/**
- * Determine winner based on scores
- */
 function determineWinner(homeScore, awayScore) {
   if (homeScore > awayScore) return 'HOME_WIN';
   if (homeScore < awayScore) return 'AWAY_WIN';
   return 'DRAW';
 }
 
-/**
- * Fetch results from football-data.org API
- */
 async function fetchFromFootballData(match) {
   try {
     const response = await axios.get(
@@ -376,45 +365,31 @@ async function fetchFromFootballData(match) {
     if (result.status === 'FINISHED') {
       const homeScore = result.score.fullTime.home ?? 0;
       const awayScore = result.score.fullTime.away ?? 0;
-      
       await updateMatchResult(match.id, {
-        homeScore,
-        awayScore,
+        homeScore, awayScore,
         status: 'FINISHED',
         winner: determineWinner(homeScore, awayScore)
       });
-      
       console.log(`✅ Match ${match.id}: ${match.home_team} ${homeScore}-${awayScore} ${match.away_team}`);
     } else if (result.status === 'IN_PLAY' || result.status === 'PAUSED') {
-      const homeScore = result.score.fullTime?.home ?? 0;
-      const awayScore = result.score.fullTime?.away ?? 0;
-      
       await updateMatchResult(match.id, {
-        homeScore,
-        awayScore,
+        homeScore: result.score.fullTime?.home ?? 0,
+        awayScore: result.score.fullTime?.away ?? 0,
         status: result.status,
         winner: null
       });
     }
   } catch (err) {
-    if (err.response?.status !== 404) {
-      console.error(`⚠️ Error fetching match ${match.id}:`, err.message);
-    }
+    if (err.response?.status !== 404) console.error(`⚠️ Error fetching match ${match.id}:`, err.message);
   }
 }
 
-/**
- * Fetch results from api-football.com API
- */
 async function fetchFromApiFootball(match) {
   try {
-    const response = await axios.get(
-      'https://v3.football.api-sports.io/fixtures',
-      {
-        headers: { 'x-apisports-key': API_FOOTBALL_KEY },
-        params: { id: match.id }
-      }
-    );
+    const response = await axios.get('https://v3.football.api-sports.io/fixtures', {
+      headers: { 'x-apisports-key': API_FOOTBALL_KEY },
+      params: { id: match.id }
+    });
 
     const fixture = response.data.response?.[0];
     if (!fixture) return;
@@ -425,30 +400,23 @@ async function fetchFromApiFootball(match) {
 
     if (status === 'FT' || status === 'AET' || status === 'PEN') {
       await updateMatchResult(match.id, {
-        homeScore,
-        awayScore,
+        homeScore, awayScore,
         status: 'FINISHED',
         winner: determineWinner(homeScore, awayScore)
       });
       console.log(`✅ Match ${match.id}: ${match.home_team} ${homeScore}-${awayScore} ${match.away_team}`);
     } else if (['1H', 'HT', '2H', 'ET', 'P', 'LIVE'].includes(status)) {
       await updateMatchResult(match.id, {
-        homeScore,
-        awayScore,
+        homeScore, awayScore,
         status: 'IN_PLAY',
         winner: null
       });
     }
   } catch (err) {
-    if (err.response?.status !== 404) {
-      console.error(`⚠️ Error fetching match ${match.id}:`, err.message);
-    }
+    if (err.response?.status !== 404) console.error(`⚠️ Error fetching match ${match.id}:`, err.message);
   }
 }
 
-/**
- * Update match result in database
- */
 async function updateMatchResult(matchId, result) {
   try {
     await query(
@@ -462,13 +430,8 @@ async function updateMatchResult(matchId, result) {
   }
 }
 
-/**
- * Main function to fetch all live/pending match results
- */
 async function fetchMatchResults() {
   const now = Math.floor(Date.now() / 1000);
-  
-  // Fetch matches that started in the last 3 hours or are upcoming within 15 minutes
   const matches = await query(
     `SELECT * FROM matches 
      WHERE start_time <= $1 + 900 
@@ -478,19 +441,13 @@ async function fetchMatchResults() {
     [now, now]
   );
 
-  if (matches.rows.length === 0) {
-    console.log("📭 No live matches to fetch");
-    return;
-  }
+  if (matches.rows.length === 0) return;
 
   console.log(`🎯 Fetching results for ${matches.rows.length} matches...`);
 
   for (const match of matches.rows) {
-    if (FOOTBALL_DATA_KEY) {
-      await fetchFromFootballData(match);
-    } else if (API_FOOTBALL_KEY) {
-      await fetchFromApiFootball(match);
-    }
+    if (FOOTBALL_DATA_KEY) await fetchFromFootballData(match);
+    else if (API_FOOTBALL_KEY) await fetchFromApiFootball(match);
   }
 }
 
@@ -498,7 +455,6 @@ async function fetchMatchResults() {
 const aiAgent = new AIMatchAgent({ geminiApiKey: GEMINI_API_KEY });
 console.log("🤖 AI Agent ready");
 
-// AI prediction cache helpers
 async function getCachedPrediction(key) {
   try {
     const r = await query(
@@ -527,12 +483,6 @@ async function savePrediction(key, prediction) {
   } catch (e) { console.warn("⚠️ AI cache write failed:", e.message); }
 }
 
-// ─── Stable pools (same for each match) ───────────────────────────────────────
-function stableRandom(seed, min, max) {
-  const x = Math.sin(seed) * 10000;
-  return Math.floor((x - Math.floor(x)) * (max - min + 1)) + min;
-}
-
 function formatMatch(row) {
   return {
     id: row.id,
@@ -550,11 +500,11 @@ function formatMatch(row) {
     awayScore: row.away_score,
     winner: row.winner,
     settled: row.status === 'FINISHED',
-    // NO pools/odds here - frontend fetches from contract
     bettingOpen: row.status === 'SCHEDULED',
     betDeadline: row.start_time - 300
   };
 }
+
 // ─── Contract Automation ──────────────────────────────────────────────────────
 async function autoCreateMatchesOnChain() {
   if (!bettingContract) return;
@@ -563,13 +513,12 @@ async function autoCreateMatchesOnChain() {
     const count = await bettingContract.matchCount();
     const onChainCount = Number(count);
     
-    // If already have 70+ matches, skip creation entirely
-    if (onChainCount >= 70) {
+    if (onChainCount >= 72) {
       console.log(`📊 ${onChainCount} matches already on-chain - skipping creation`);
       return;
     }
     
-    console.log(`📊 ${onChainCount} matches on-chain, checking for missing...`);
+    console.log(`📊 ${onChainCount} matches on-chain, creating missing...`);
     
     const { rows } = await query(
       "SELECT * FROM matches WHERE round = 'Group Stage' ORDER BY id"
@@ -578,7 +527,6 @@ async function autoCreateMatchesOnChain() {
     let created = 0;
     
     for (const match of rows) {
-      // Skip if match already exists on-chain
       if (match.id - 1 < onChainCount) continue;
       
       try {
@@ -601,11 +549,11 @@ async function autoCreateMatchesOnChain() {
     console.error('❌ autoCreateMatchesOnChain error:', err.message);
   }
 }
+
 async function autoSettleMatchesOnChain() {
   if (!bettingContract) return;
 
   try {
-    // Get finished matches that have a winner
     const { rows } = await query(
       "SELECT * FROM matches WHERE status = 'FINISHED' AND winner IS NOT NULL AND winner != ''"
     );
@@ -616,55 +564,34 @@ async function autoSettleMatchesOnChain() {
 
     for (const match of rows) {
       try {
-        // Check if already settled on-chain
         const contractMatch = await bettingContract.getMatch(match.id);
-        
-        // If already settled, skip
         if (contractMatch[5]) {
           console.log(`⏭️ Match ${match.id} already settled on-chain`);
           continue;
         }
 
-        // Map winner to contract enum
-        const outcomeMap = {
-          'HOME_WIN': 1,
-          'DRAW': 2,
-          'AWAY_WIN': 3
-        };
-        
+        const outcomeMap = { 'HOME_WIN': 1, 'DRAW': 2, 'AWAY_WIN': 3 };
         const outcome = outcomeMap[match.winner];
-        if (!outcome) {
-          console.warn(`⚠️ Unknown winner for match ${match.id}: ${match.winner}`);
-          continue;
-        }
+        if (!outcome) continue;
 
         console.log(`🤖 Settling match ${match.id}: ${match.home_team} vs ${match.away_team} → ${match.winner}`);
-        
         const tx = await bettingContract.settleMatch(match.id, outcome);
         await tx.wait();
-        
         console.log(`✅ Match ${match.id} settled on-chain`);
-        
-        // Small delay to avoid rate limiting
         await new Promise(r => setTimeout(r, 2000));
-        
       } catch (e) {
-        // Skip individual match errors
         if (e.message?.includes('already settled')) {
           console.log(`⏭️ Match ${match.id} already settled`);
-        } else if (e.message?.includes('match not started')) {
-          console.log(`⏭️ Match ${match.id} hasn't started yet`);
-        } else {
+        } else if (!e.message?.includes('match not started')) {
           console.error(`❌ Settle match ${match.id} failed:`, e.message?.slice(0, 100));
         }
       }
     }
-    
   } catch (err) {
     console.error('❌ autoSettleMatchesOnChain error:', err.message);
-    // Don't crash the server
   }
 }
+
 async function autoSettleUltimateOnChain() {
   if (!bettingContract) return;
 
@@ -688,15 +615,11 @@ async function autoSettleUltimateOnChain() {
       const tx = await bettingContract.settleUltimate(winner);
       await tx.wait();
       console.log(`✅ Ultimate settled on-chain: ${winner}`);
-      
     } catch (e) {
-      if (e.message?.includes('already settled')) {
-        console.log('⏭️ Ultimate already settled');
-      } else {
+      if (!e.message?.includes('already settled')) {
         console.error('❌ Ultimate settle failed:', e.message?.slice(0, 100));
       }
     }
-    
   } catch (err) {
     console.error('❌ autoSettleUltimateOnChain error:', err.message);
   }
@@ -704,36 +627,20 @@ async function autoSettleUltimateOnChain() {
 
 async function runAutomation() {
   if (!bettingContract) return;
-  
   console.log('🤖 Running automation...');
-  
-  try {
-    await autoCreateMatchesOnChain();
-  } catch (e) {
-    console.error('❌ createMatches error:', e.message);
-  }
-  
-  try {
-    await autoSettleMatchesOnChain();
-  } catch (e) {
-    console.error('❌ settleMatches error:', e.message);
-  }
-  
-  try {
-    await autoSettleUltimateOnChain();
-  } catch (e) {
-    console.error('❌ settleUltimate error:', e.message);
-  }
-  
+  try { await autoCreateMatchesOnChain(); } catch (e) { console.error('❌ createMatches error:', e.message); }
+  try { await autoSettleMatchesOnChain(); } catch (e) { console.error('❌ settleMatches error:', e.message); }
+  try { await autoSettleUltimateOnChain(); } catch (e) { console.error('❌ settleUltimate error:', e.message); }
   console.log('✅ Automation complete');
 }
+
 // ════════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ════════════════════════════════════════════════════════════════════════
 
 app.get("/", (req, res) => res.json({
   name: "World Cup 2026 API",
-  description: "Complete 102-match World Cup 2026 schedule with live result fetching",
+  description: "Official 104-match schedule with live result fetching",
   endpoints: {
     matches: "GET /api/matches",
     match: "GET /api/matches/:id",
@@ -752,78 +659,49 @@ app.get("/", (req, res) => res.json({
   }
 }));
 
-// Health check
 app.get("/api/health", async (req, res) => {
   try {
     const r = await query("SELECT COUNT(*) FROM matches");
-    const now = Math.floor(Date.now() / 1000);
-    const liveCount = await query(
-      "SELECT COUNT(*) FROM matches WHERE start_time <= $1 AND status IN ('SCHEDULED', 'IN_PLAY')",
-      [now + 300]
-    );
     res.json({ 
       status: "ok", 
       matchesInDB: parseInt(r.rows[0].count),
-      liveMatches: parseInt(liveCount.rows[0].count),
-      resultSource: FOOTBALL_DATA_KEY ? 'football-data.org' : (API_FOOTBALL_KEY ? 'api-football' : 'manual'),
       timestamp: new Date().toISOString() 
     });
   } catch (err) { 
     res.json({ status: "ok", matchesInDB: 0, error: err.message }); 
   }
 });
-// Add after POST /api/fetch-results route:
+
 app.post("/api/admin/run-automation", async (req, res) => {
   try {
     await runAutomation();
     res.json({ success: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
-// GET /api/matches - All matches with optional group filter
+
 app.get("/api/matches", async (req, res) => {
   try {
     const { group, round, status } = req.query;
-    
     let sql = "SELECT * FROM matches WHERE 1=1";
     const params = [];
     let paramCount = 1;
     
-    if (group) {
-      sql += ` AND group_name = $${paramCount++}`;
-      params.push(group);
-    }
-    if (round) {
-      sql += ` AND round = $${paramCount++}`;
-      params.push(round);
-    }
-    if (status) {
-      sql += ` AND status = $${paramCount++}`;
-      params.push(status);
-    }
+    if (group) { sql += ` AND group_name = $${paramCount++}`; params.push(group); }
+    if (round) { sql += ` AND round = $${paramCount++}`; params.push(round); }
+    if (status) { sql += ` AND status = $${paramCount++}`; params.push(status); }
     
     sql += " ORDER BY start_time ASC";
-    
     const r = await query(sql, params);
-    
-    if (r.rows.length === 0) {
-      return res.json({
-        matches: [],
-        total: 0,
-        message: "No matches found. Run POST /api/refresh to load fixtures."
-      });
-    }
     
     res.json({ 
       matches: r.rows.map(formatMatch), 
-      total: r.rows.length,
-      filters: { group: group || null, round: round || null, status: status || null }
+      total: r.rows.length
     });
   } catch (err) { 
     res.status(500).json({ error: err.message }); 
   }
 });
 
-// GET /api/matches/live - Matches currently in play or about to start
 app.get("/api/matches/live", async (req, res) => {
   try {
     const now = Math.floor(Date.now() / 1000);
@@ -841,7 +719,6 @@ app.get("/api/matches/live", async (req, res) => {
   }
 });
 
-// GET /api/matches/:id - Single match detail
 app.get("/api/matches/:id", async (req, res) => {
   try {
     const r = await query("SELECT * FROM matches WHERE id=$1", [req.params.id]);
@@ -852,7 +729,6 @@ app.get("/api/matches/:id", async (req, res) => {
   }
 });
 
-// POST /api/matches/:id/result - Manual result input (admin/testing)
 app.post("/api/matches/:id/result", async (req, res) => {
   const { homeScore, awayScore, status: matchStatus } = req.body;
   const matchId = parseInt(req.params.id);
@@ -868,309 +744,159 @@ app.post("/api/matches/:id/result", async (req, res) => {
     
     const status = matchStatus || 'FINISHED';
     const winner = status === 'FINISHED' ? determineWinner(homeScore, awayScore) : null;
-    
-    await updateMatchResult(matchId, {
-      homeScore,
-      awayScore,
-      status,
-      winner
-    });
-    
+    await updateMatchResult(matchId, { homeScore, awayScore, status, winner });
     const updated = await query("SELECT * FROM matches WHERE id = $1", [matchId]);
-    
-    res.json({ 
-      success: true, 
-      message: `Match ${matchId} updated`,
-      match: formatMatch(updated.rows[0])
-    });
+    res.json({ success: true, match: formatMatch(updated.rows[0]) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/stats - Complete platform statistics
 app.get("/api/stats", async (req, res) => {
   try {
-    const [matches, bets, users, volume, byGroup, byRound] = await Promise.all([
+    const [matches, bets, users, volume] = await Promise.all([
       query("SELECT COUNT(*) FROM matches"),
       query("SELECT COUNT(*) FROM bets"),
       query("SELECT COUNT(DISTINCT user_address) FROM bets"),
-      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets"),
-      query("SELECT group_name, COUNT(*) FROM matches WHERE group_name IS NOT NULL GROUP BY group_name ORDER BY group_name"),
-      query("SELECT round, COUNT(*) FROM matches WHERE round IS NOT NULL GROUP BY round ORDER BY MIN(id)")
+      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets")
     ]);
-    
     res.json({
       matchCount: parseInt(matches.rows[0].count),
       totalBets: parseInt(bets.rows[0].count),
       uniqueUsers: parseInt(users.rows[0].count),
-      totalVolumeCLUTCH: volume.rows[0].total || 0,
-      groups: byGroup.rows,
-      rounds: byRound.rows,
-      timestamp: new Date().toISOString()
+      totalVolumeCLUTCH: volume.rows[0].total || 0
     });
-  } catch (err) { 
-    // Fallback if tables don't exist yet
-    try {
-      const total = await query("SELECT COUNT(*) FROM matches");
-      res.json({
-        matchCount: parseInt(total.rows[0].count),
-        totalBets: 0,
-        uniqueUsers: 0,
-        totalVolumeCLUTCH: 0,
-        groups: [],
-        rounds: []
-      });
-    } catch {
-      res.status(500).json({ error: err.message });
-    }
+  } catch {
+    res.json({ matchCount: 104, totalBets: 0, uniqueUsers: 0, totalVolumeCLUTCH: 0 });
   }
 });
 
-// GET /api/user/:address/bets - User betting history
 app.get("/api/user/:address/bets", async (req, res) => {
-  const userAddress = req.params.address.toLowerCase();
-  
   try {
     const [matchBets, ultimateBets] = await Promise.all([
-      query(
-        `SELECT b.*, m.home_team, m.away_team, m.home_score, m.away_score, 
-                m.winner as match_outcome, m.status as match_status
-         FROM bets b 
-         LEFT JOIN matches m ON b.match_id = m.id 
-         WHERE b.user_address = $1 
-         ORDER BY b.created_at DESC`,
-        [userAddress]
-      ),
-      query(
-        "SELECT * FROM ultimate_bets WHERE user_address = $1 ORDER BY created_at DESC",
-        [userAddress]
-      )
+      query(`SELECT b.*, m.home_team, m.away_team, m.winner as match_outcome, m.status as match_status FROM bets b LEFT JOIN matches m ON b.match_id = m.id WHERE b.user_address = $1 ORDER BY b.created_at DESC`, [req.params.address.toLowerCase()]),
+      query("SELECT * FROM ultimate_bets WHERE user_address = $1 ORDER BY created_at DESC", [req.params.address.toLowerCase()])
     ]);
-    
-    res.json({ 
-      matchBets: matchBets.rows, 
-      ultimateBets: ultimateBets.rows 
-    });
+    res.json({ matchBets: matchBets.rows, ultimateBets: ultimateBets.rows });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/bets - Record bet after on-chain transaction
 app.post("/api/bets", async (req, res) => {
   const { matchId, userAddress, prediction, amount, txHash } = req.body;
-  
   if (!matchId || !userAddress || !prediction || !amount) {
-    return res.status(400).json({ error: "Missing required fields: matchId, userAddress, prediction, amount" });
+    return res.status(400).json({ error: "Missing required fields" });
   }
-  
   try {
     const result = await query(
       "INSERT INTO bets (match_id, user_address, prediction, amount, tx_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id",
       [matchId, userAddress.toLowerCase(), prediction, amount.toString(), txHash || null]
     );
-    
-    res.json({ 
-      success: true, 
-      betId: result.rows[0].id,
-      message: "Bet recorded in database"
-    });
+    res.json({ success: true, betId: result.rows[0].id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/ultimate-bets - Record ultimate bet
 app.post("/api/ultimate-bets", async (req, res) => {
   const { userAddress, team, amount, txHash } = req.body;
-  
-  if (!userAddress || !team || !amount) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-  
+  if (!userAddress || !team || !amount) return res.status(400).json({ error: "Missing required fields" });
   try {
-    await query(
-      "INSERT INTO ultimate_bets (user_address, team, amount, tx_hash) VALUES ($1, $2, $3, $4)",
-      [userAddress.toLowerCase(), team, amount.toString(), txHash || null]
-    );
-    
-    res.json({ success: true, message: "Ultimate bet recorded" });
+    await query("INSERT INTO ultimate_bets (user_address, team, amount, tx_hash) VALUES ($1, $2, $3, $4)", [userAddress.toLowerCase(), team, amount.toString(), txHash || null]);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/leaderboard - Top predictors
 app.get("/api/leaderboard", async (req, res) => {
   try {
-    const [leaderboard, ultimateStats] = await Promise.all([
-      query(
-        `SELECT 
-           user_address as user, 
-           COUNT(*) as bet_count, 
-           COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total_wagered,
-           COUNT(CASE WHEN claimed = true THEN 1 END) as wins_claimed
-         FROM bets 
-         GROUP BY user_address 
-         ORDER BY total_wagered DESC 
-         LIMIT 20`
-      ),
-      query(
-        `SELECT 
-           user_address as user, 
-           COUNT(*) as ultimate_bets,
-           COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as ultimate_wagered
-         FROM ultimate_bets
-         GROUP BY user_address
-         ORDER BY ultimate_wagered DESC
-         LIMIT 20`
-      )
-    ]);
-    
-    res.json({ 
-      leaderboard: leaderboard.rows,
-      ultimateLeaderboard: ultimateStats.rows
-    });
-  } catch (err) {
-    // Fallback if tables don't exist
-    res.json({ 
-      leaderboard: [],
-      ultimateLeaderboard: [],
-      message: "No data yet - start placing bets!"
-    });
+    const r = await query(
+      `SELECT user_address as user, COUNT(*) as bet_count, COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total_wagered, COUNT(CASE WHEN claimed = true THEN 1 END) as wins_claimed FROM bets GROUP BY user_address ORDER BY total_wagered DESC LIMIT 20`
+    );
+    res.json({ leaderboard: r.rows });
+  } catch {
+    res.json({ leaderboard: [] });
   }
 });
 
-// GET /api/ultimate - Ultimate bet status and pools
 app.get("/api/ultimate", async (req, res) => {
   try {
-    const [totalPool, teamPools, settings] = await Promise.all([
+    const [total, teams, settings] = await Promise.all([
       query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM ultimate_bets"),
       query("SELECT team, SUM(CAST(amount AS DECIMAL)) as amount FROM ultimate_bets GROUP BY team ORDER BY amount DESC"),
       query("SELECT * FROM betting_settings WHERE id = 1")
     ]);
-    
-    const setting = settings.rows[0] || {};
-    
+    const s = settings.rows[0] || {};
     res.json({
-      deadline: setting.ultimate_deadline || Math.floor(Date.now() / 1000) + 2592000,
-      settled: setting.ultimate_settled || false,
-      winner: setting.ultimate_winner || null,
-      totalPool: totalPool.rows[0].total || "0",
-      teamPools: teamPools.rows
+      deadline: s.ultimate_deadline || 1753038600,
+      settled: s.ultimate_settled || false,
+      winner: s.ultimate_winner || null,
+      totalPool: total.rows[0].total || "0",
+      teamPools: teams.rows
     });
-  } catch (err) {
-    // Fallback
-    res.json({
-      deadline: Math.floor(Date.now() / 1000) + 2592000,
-      settled: false,
-      winner: null,
-      totalPool: "0",
-      teamPools: []
-    });
+  } catch {
+    res.json({ deadline: 1753038600, settled: false, winner: null, totalPool: "0", teamPools: [] });
   }
 });
 
-// POST /api/ultimate/settle - Settle ultimate bet (admin)
 app.post("/api/ultimate/settle", async (req, res) => {
   const { winner } = req.body;
-  
   if (!winner) return res.status(400).json({ error: "winner required" });
-  
   try {
-    await query(
-      "UPDATE betting_settings SET ultimate_settled = true, ultimate_winner = $1 WHERE id = 1",
-      [winner]
-    );
-    
-    res.json({ success: true, message: `Ultimate bet settled! Winner: ${winner}` });
+    await query("UPDATE betting_settings SET ultimate_settled = true, ultimate_winner = $1 WHERE id = 1", [winner]);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// GET /api/analyze - AI analysis by team names
 app.get("/api/analyze", async (req, res) => {
   const { home, away } = req.query;
   if (!home || !away) return res.status(400).json({ error: "Provide home and away" });
-  
   const key = `predict:${home.toLowerCase()}:${away.toLowerCase()}`;
   try {
     const cached = await getCachedPrediction(key);
     if (cached) return res.json(cached);
-    
-    console.log(`🔍 Analyzing: ${home} vs ${away}`);
     const result = await aiAgent.predict(home, away);
     await savePrediction(key, result);
     res.json(result);
   } catch (err) { 
-    console.error("❌ Analysis error:", err); 
     res.status(500).json({ error: err.message }); 
   }
 });
 
-// GET /api/ai/analyze/:matchId - AI analysis by match ID
 app.get("/api/ai/analyze/:matchId", async (req, res) => {
   try {
     const r = await query("SELECT * FROM matches WHERE id=$1", [req.params.matchId]);
     if (!r.rows.length) return res.status(404).json({ error: "Match not found" });
-    
     const m = r.rows[0];
     const key = `predict:${m.home_team.toLowerCase()}:${m.away_team.toLowerCase()}`;
-    
     const cached = await getCachedPrediction(key);
     if (cached) return res.json({ matchId: m.id, ...cached });
-    
-    console.log(`🔍 Analyzing match ${m.id}: ${m.home_team} vs ${m.away_team}`);
     const result = await aiAgent.predict(m.home_team, m.away_team);
     await savePrediction(key, result);
-    res.json({ matchId: m.id, ...result, timestamp: new Date().toISOString() });
+    res.json({ matchId: m.id, ...result });
   } catch (err) { 
-    console.error("❌ Analysis error:", err); 
     res.status(500).json({ error: err.message }); 
   }
 });
 
-// POST /api/refresh - Reload fixtures from hardcoded list
 app.post("/api/refresh", async (req, res) => {
   try {
     const stored = await fetchAndCacheMatches();
     const total = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count);
-    res.json({ 
-      success: true, 
-      stored, 
-      totalMatches: total,
-      message: `Loaded ${stored} World Cup matches`
-    });
+    res.json({ success: true, stored, totalMatches: total });
   } catch (err) { 
-    res.status(500).json({ success: false, error: err.message }); 
+    res.status(500).json({ error: err.message }); 
   }
 });
 
-// POST /api/fetch-results - Manually trigger result fetching
 app.post("/api/fetch-results", async (req, res) => {
   try {
-    if (!FOOTBALL_DATA_KEY && !API_FOOTBALL_KEY) {
-      return res.json({ 
-        success: false, 
-        message: "No API key configured. Set FOOTBALL_DATA_API_KEY or API_FOOTBALL_KEY.",
-        availableSources: ['football-data.org', 'api-football.com']
-      });
-    }
-    
-    console.log("🔄 Manual result fetch triggered");
     await fetchMatchResults();
-    
-    const updated = await query(
-      "SELECT COUNT(*) FROM matches WHERE status = 'FINISHED' AND last_updated > NOW() - INTERVAL '1 minute'"
-    );
-    
-    res.json({ 
-      success: true, 
-      message: "Results fetched",
-      updatedMatches: parseInt(updated.rows[0].count)
-    });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1180,42 +906,17 @@ app.post("/api/fetch-results", async (req, res) => {
 
 function scheduleAutoRefresh() {
   setInterval(async () => {
-    console.log("🔄 Auto-refreshing matches...");
-    try { await fetchAndCacheMatches(); }
-    catch (e) { console.error("❌ Auto-refresh failed:", e.message); }
+    try { await fetchAndCacheMatches(); } catch (e) {}
   }, 6 * 60 * 60 * 1000);
   console.log("⏰ Auto-refresh scheduled every 6 hours");
 }
 
 function scheduleResultFetching() {
   if (!FOOTBALL_DATA_KEY && !API_FOOTBALL_KEY) {
-    console.log("⚠️ No result API keys configured. Use POST /api/matches/:id/result for manual input.");
-    console.log("   Get a free key at: https://www.football-data.org/ or https://www.api-football.com/");
-    
-    // Still run to check if there are manual updates needed
-    setInterval(() => {
-      console.log("⏰ No auto-fetch keys configured. Results must be entered manually.");
-    }, 30 * 60 * 1000);
+    console.log("⚠️ No result API keys. Use POST /api/matches/:id/result for manual input.");
     return;
   }
-
-  setInterval(async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const liveMatches = await query(
-      `SELECT COUNT(*) FROM matches 
-       WHERE start_time <= $1 + 900 
-       AND start_time >= $2 - 10800
-       AND status IN ('SCHEDULED', 'IN_PLAY', 'PAUSED')`,
-      [now, now]
-    ).catch(() => ({ rows: [{ count: 0 }] }));
-    
-    const count = parseInt(liveMatches.rows[0].count);
-    if (count > 0) {
-      console.log(`🎯 ${count} potential live matches - fetching results...`);
-      await fetchMatchResults();
-    }
-  }, 5 * 60 * 1000); // Every 5 minutes
-  
+  setInterval(fetchMatchResults, 5 * 60 * 1000);
   console.log("⏰ Live result fetching scheduled every 5 minutes");
 }
 
@@ -1224,7 +925,7 @@ async function start() {
   console.log("\n" + "=".repeat(55));
   console.log("🌍 World Cup 2026 API");
   console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Google Gemini' : '❌ Missing'}`);
-  console.log(`📊 Results: ${FOOTBALL_DATA_KEY ? '✅ football-data.org' : (API_FOOTBALL_KEY ? '✅ api-football' : '⚠️ Manual input only')}`);
+  console.log(`📊 Results: ${FOOTBALL_DATA_KEY ? '✅ football-data.org' : (API_FOOTBALL_KEY ? '✅ api-football' : '⚠️ Manual')}`);
   console.log(`🗄️  DB: ${DATABASE_URL ? '✅ Neon PostgreSQL' : '❌ Missing'}`);
   console.log(`🔗 Contract: ${BETTING_ADDRESS ? '✅ Configured' : '⚠️ Not set'}`);
   console.log("=".repeat(55));
@@ -1238,15 +939,12 @@ async function start() {
     console.log(`📊 Serving ${matchCount} World Cup matches from DB`);
   }
 
-  // Initialize admin for automation
   const adminReady = initAdmin();
-
   scheduleAutoRefresh();
   scheduleResultFetching();
 
-  // Schedule contract automation if admin configured
   if (adminReady) {
-    setTimeout(runAutomation, 5000); // 5s delay to ensure everything is ready
+    setTimeout(runAutomation, 5000);
     setInterval(runAutomation, 5 * 60 * 1000);
     console.log("⏰ Contract automation scheduled every 5 minutes");
   }
@@ -1254,8 +952,9 @@ async function start() {
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
     console.log(`\n🚀 Server running on port ${PORT}`);
-    console.log(`⚽ Matches     : GET  /api/matches`);
+    console.log(`⚽ Matches : GET /api/matches`);
     console.log(`🤖 Automation : ${adminReady ? '✅ ENABLED' : '⚠️ DISABLED'}`);
+    console.log(`📅 Ultimate Deadline: July 20, 2026 00:30 UTC`);
     console.log("=".repeat(55));
   });
 }
