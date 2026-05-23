@@ -150,7 +150,7 @@ async function initDatabase() {
     INSERT INTO betting_settings (id, ultimate_deadline) 
     VALUES (1, $1)
     ON CONFLICT (id) DO UPDATE SET ultimate_deadline = EXCLUDED.ultimate_deadline
-  `, [1753038600]);
+  `, [1784577000]);
 
   const count = parseInt((await query("SELECT COUNT(*) FROM matches")).rows[0].count || "0");
   console.log(`✅ DB ready — ${count} cached matches`);
@@ -830,14 +830,14 @@ app.get("/api/ultimate", async (req, res) => {
     ]);
     const s = settings.rows[0] || {};
     res.json({
-      deadline: s.ultimate_deadline || 1753038600,
+      deadline: s.ultimate_deadline || 1784577000,
       settled: s.ultimate_settled || false,
       winner: s.ultimate_winner || null,
       totalPool: total.rows[0].total || "0",
       teamPools: teams.rows
     });
   } catch {
-    res.json({ deadline: 1753038600, settled: false, winner: null, totalPool: "0", teamPools: [] });
+    res.json({ deadline: 1784577000, settled: false, winner: null, totalPool: "0", teamPools: [] });
   }
 });
 
