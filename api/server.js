@@ -915,6 +915,25 @@ app.post("/api/fetch-results", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// POST /api/matches/:id/teams - Update match team names
+app.post("/api/matches/:id/teams", async (req, res) => {
+  const { homeTeam, awayTeam } = req.body;
+  const matchId = parseInt(req.params.id);
+  
+  if (isNaN(matchId)) return res.status(400).json({ error: "Invalid match ID" });
+  if (!homeTeam || !awayTeam) return res.status(400).json({ error: "homeTeam and awayTeam required" });
+  
+  try {
+    await query(
+      "UPDATE matches SET home_team = $1, away_team = $2, last_updated = CURRENT_TIMESTAMP WHERE id = $3",
+      [homeTeam, awayTeam, matchId]
+    );
+    const updated = await query("SELECT * FROM matches WHERE id = $1", [matchId]);
+    res.json({ success: true, match: formatMatch(updated.rows[0]) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ─── Scheduling ───────────────────────────────────────────────────────────────
 
